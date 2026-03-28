@@ -527,19 +527,19 @@ public:
      *          distance. It includes every point \f$(x,y,\ldots)\f$ with \f$|x-c_x|\le r\f$, etc.
      * \return Output iterator past the last written element.
      */
-    template <typename SearchVal, typename _OutputIterator>
-    _OutputIterator findWithinRange(SearchVal const& val,
+    template <typename SearchVal, typename OutputIterator>
+    OutputIterator findWithinRange(SearchVal const& val,
                                       subvalue_type const range,
-                                      _OutputIterator out) const
+                                      OutputIterator out) const
     {
         if (!root()) return out;
         Region region(val, range, mAcc, mCmp);
         return this->findWithinRange(region, out);
     }
 
-    template <typename _OutputIterator>
-    _OutputIterator findWithinRange(Region const& region,
-                                      _OutputIterator out) const
+    template <typename OutputIterator>
+    OutputIterator findWithinRange(Region const& region,
+                                      OutputIterator out) const
     {
         if (root()) {
             Region bounds(region);
@@ -1000,8 +1000,8 @@ protected:
         return visitor;
     }
 
-    template <typename _OutputIterator>
-    _OutputIterator findWithinRangeRec(_OutputIterator out,
+    template <typename OutputIterator>
+    OutputIterator findWithinRangeRec(OutputIterator out,
                                          LinkConstType pNode,
                                          Region const& refRegion,
                                          Region const& refBounds,
