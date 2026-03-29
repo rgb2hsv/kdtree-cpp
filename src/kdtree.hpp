@@ -176,7 +176,7 @@ public:
           mCmp(refCmp),
           mDist(refDist)
     {
-        initialize_empty();
+        initializeEmpty();
     }
 
     //! Copy constructor: rebuilds an optimized tree from \p refRhs (bulk optimize, not per-insert).
@@ -188,7 +188,7 @@ public:
           mCmp(refRhs.mCmp),
           mDist(refRhs.mDist)
     {
-        initialize_empty();
+        initializeEmpty();
         // this is slow:
         // this->insert(begin(), __x.begin(), __x.end());
         // this->optimise();
@@ -220,7 +220,7 @@ public:
           mCmp(refCmp),
           mDist(refDist)
     {
-        initialize_empty();
+        initializeEmpty();
         // this is slow:
         // this->insert(begin(), __first, __last);
         // this->optimise();
@@ -432,7 +432,7 @@ public:
         while ((n = parentOf(n)) != &mHdr) ++level;
         LinkType const mutableTarget = asMutableNode(target);
         erase(mutableTarget, level);
-        delete_node(mutableTarget);
+        deleteNode(mutableTarget);
         --mNodeCount;
     }
 
@@ -682,7 +682,7 @@ protected:
         }
     }
 
-    void initialize_empty()
+    void initializeEmpty()
     {
         setLeftmost(&mHdr);
         setRightmost(&mHdr);
@@ -723,7 +723,7 @@ protected:
     LinkType erase(LinkType dead_dad, size_type const level)
     {
         // find a new step_dad, he will become a drop-in replacement.
-        LinkType step_dad = get_erase_replacement(dead_dad, level);
+        LinkType step_dad = getEraseReplacement(dead_dad, level);
 
         // tell dead_dad's parent that his new child is step_dad
         if (dead_dad == root())
@@ -757,7 +757,7 @@ protected:
         return step_dad;
     }
 
-    LinkType get_erase_replacement(LinkType node, size_type const level)
+    LinkType getEraseReplacement(LinkType node, size_type const level)
     {
         // if 'node' is null, then we can't do any better
         if (isLeaf(node)) return nullptr;
@@ -867,7 +867,7 @@ protected:
         while (pWalk) {
             eraseSubtree(rightOf(pWalk));
             LinkType pLeftHold = leftOf(pWalk);
-            delete_node(pWalk);
+            deleteNode(pWalk);
             pWalk = pLeftHold;
         }
     }
@@ -930,7 +930,7 @@ protected:
         return !(Compare(pNode->mValue, refVal) || Compare(refVal, pNode->mValue));
     }
 
-    bool matches_node_in_other_dims(LinkConstType pNode, const_reference refVal,
+    bool matchesNodeInOtherDims(LinkConstType pNode, const_reference refVal,
                                      size_type const uLevel = 0) const
     {
         size_type uDimIdx = uLevel;
@@ -943,7 +943,7 @@ protected:
                          size_type uLevel = 0) const
     {
         return matchesNodeInDimension(pNode, refVal, uLevel) &&
-               matches_node_in_other_dims(pNode, refVal, uLevel);
+               matchesNodeInOtherDims(pNode, refVal, uLevel);
     }
 
     size_type countWithinRangeRecursive(LinkConstType pNode,
@@ -1147,7 +1147,7 @@ protected:
     }
     */
 
-    void delete_node(LinkType pNode)
+    void deleteNode(LinkType pNode)
     {
         Base::destroyNode(pNode);
         Base::deallocateNode(pNode);
