@@ -9,8 +9,8 @@ Header-only **k-dimensional tree** for C++20: spatial ordering, nearest-neighbor
 
 ## Version
 
-- CMake package version: **0.7.1**
-- Macros in `kdtree.hpp`: `KDTREE_VERSION` (701), `KDTREE_LIB_VERSION` (`"0_7_1"`)
+- CMake package version: **0.8.0**
+- Macros in `kdtree.hpp`: `KDTREE_VERSION` (800), `KDTREE_LIB_VERSION` (`"0_8_0"`)
 
 ## Usage
 
@@ -36,12 +36,15 @@ auto it = tree.findNearest(query);
 
 ### Typical operations
 
-- **Insert / clear**: `insert`, `clear`, range constructors, `assignOptimized` (bulk rebuild using a vector in place)
-- **Lookup**: `find` (by coordinates), `findExact` (by `operator==` on value)
+- **Construct / assign**: range (incl. single-pass iterators) and initializer-list constructors build a balanced tree; O(1) move construction / assignment and `swap`; `assignOptimized` (bulk rebuild from a vector, copying or moving)
+- **Insert / clear**: `insert` (copy or move), `emplace`, `clear`
+- **Lookup**: `find` (by coordinates), `findExact` (by `operator==` on value), `contains`
 - **Nearest**: `findNearest`, optional max radius, `findNearestIf` with a predicate
 - **Range**: `countWithinRange`, `visitWithinRange`, `findWithinRange` (L∞-style boxes in accessor space by default)
-- **Erase**: `erase` (iterator or coordinate-equivalent value), `eraseExact`
-- **Maintenance**: `optimize` (rebuild balanced from sorted order)
+- **Erase**: `erase` (iterator, or coordinate-equivalent value), `eraseExact`; the value overloads return the number removed (0 or 1). Erasing never invalidates iterators to other elements.
+- **Maintenance**: `optimize` (rebalance via median splits), `height`, `checkTreeInvariants` (returns `bool`; works in release builds)
+
+All traversals are iterative or depth-capped, so even a degenerate tree (e.g. built by inserting sorted points one at a time) cannot overflow the call stack.
 
 Accessors on the tree: `valueAccessor`, `valueComparator`, `valueDistance`, `getAllocator`, `maxSize`.
 
@@ -72,7 +75,7 @@ The interface target exports include directories for the libkdtree source direct
 
 ## Tests
 
-Unit tests live in `tests/test.cpp` (GoogleTest). With `LIBKDTREE_BUILD_TESTS=ON`, the executable `libkdtree_tests` is registered with CTest (label `libkdtree`).
+Unit tests live in `tests/test.cpp`; `tests/test_large.cpp` stress-tests uniform, clustered, lattice/duplicate-heavy, high-dimensional and degenerate data (tens of thousands of points), cross-checking every query against brute force, plus allocator, move and exception-safety tests (GoogleTest). With `LIBKDTREE_BUILD_TESTS=ON`, the executable `libkdtree_tests` is registered with CTest (label `libkdtree`).
 
 ## Optional compile-time defines
 
@@ -98,5 +101,5 @@ Original libkdtree++ is distributed under the **Artistic License 2.0**. See the 
 | `node.hpp` | `TreeNode`, `NodeBase`, nearest-neighbor helpers |
 | `region.hpp` | `KdTreeRegion` |
 | `iterator.hpp` | `TreeIterator` |
-| `allocator.hpp` | `AllocBase`, RAII node allocation |
+| `allocator.hpp` | `AllocBase`, node allocation via `std::allocator_traits` |
 | `function.hpp` | `BracketAccessor`, `SquaredDifference`, helpers |

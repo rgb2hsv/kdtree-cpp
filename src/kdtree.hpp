@@ -29,7 +29,7 @@
  * the right So, KDTree has the relationships:
  *    * The left branch is <= its parent (in binary tree, this relationship is a
  * plain < )
- *    * The right branch is <= its parent (same as binary tree)
+ *    * The right branch is >= its parent (same as binary tree)
  *
  *    This is done for mostly for performance.
  *    Its a LOT easier to maintain a consistent tree if we use the <=
@@ -67,29 +67,29 @@
 //
 //! \ingroup libkdtree
 //! Integer library version: patch = `KDTREE_VERSION % 100`, minor = `(KDTREE_VERSION / 100) % 1000`, major = `KDTREE_VERSION / 100000`.
-#define KDTREE_VERSION 701
+#define KDTREE_VERSION 800
 //! String library version, same logical version as \ref KDTREE_VERSION (form `major_minor[_patch]`).
-#define KDTREE_LIB_VERSION "0_7_1"
+#define KDTREE_LIB_VERSION "0_8_0"
 
-#include <vector>
-
-#ifdef KDTREE_CHECK_PERFORMANCE_COUNTERS
-#include <map>
-#endif
 #include <algorithm>
+#include <array>
+#include <cassert>
+#include <cmath>
 #include <concepts>
+#include <cstddef>
 #include <functional>
+#include <initializer_list>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 #ifdef KDTREE_DEFINE_OSTREAM_OPERATORS
 #include <ostream>
-#include <stack>
 #endif
-
-#include <cmath>
-#include <cstddef>
-#include <cassert>
-#include <iterator>
-#include <limits>
 
 #include "function.hpp"
 #include "allocator.hpp"
@@ -112,7 +112,7 @@ namespace libkdtree
 
 #ifdef KDTREE_CHECK_PERFORMANCE
 //! Incremented by instrumented distance functors when `KDTREE_CHECK_PERFORMANCE` is defined.
-unsigned long long numDistCalcs = 0;
+inline unsigned long long numDistCalcs = 0;
 #endif
 
 /**
@@ -123,6 +123,10 @@ unsigned long long numDistCalcs = 0;
  * both subtrees because the implementation uses a \f$\le\f$ (not strict \f$<\f$)
  * discipline on the active dimension—see the notes at the top of this header.
  *
+ * All traversals (insert, find, range queries, nearest neighbour, erase, clear)
+ * are iterative and walk parent links, so they neither recurse nor allocate:
+ * a degenerate (e.g. sorted-insert) tree cannot overflow the call stack.
+ *
  * \tparam K Number of dimensions.
  * \tparam Val Element type stored in the tree (e.g. a point type).
  * \tparam Acc Coordinate accessor: `result_type operator()(Val const&, std::size_t dim) const`.
@@ -131,19 +135,23 @@ unsigned long long numDistCalcs = 0;
  *         dimensions for nearest-neighbor search. Default \ref SquaredDifference yields
  *         Euclidean distance in \ref findNearest results (square root of the sum of per-axis squares).
  * \tparam Cmp Strict weak ordering on scalar coordinates; default `std::less`.
- * \tparam Alloc Allocator for `TreeNode<Val>` nodes.
+ * \tparam Alloc Allocator for `TreeNode<Val>` (an allocator for \c Val is rebound automatically).
  */
 template <std::size_t K, typename Val,
           typename Acc = BracketAccessor<Val>,
           typename Dist = SquaredDifference<typename Acc::result_type,
-                                              typename Acc::result_type>,
+                                            typename Acc::result_type>,
           typename Cmp = std::less<typename Acc::result_type>,
-          typename Alloc = std::allocator<TreeNode<Val> > >
+          typename Alloc = std::allocator<TreeNode<Val>>>
 class KDTree : protected AllocBase<Val, Alloc>
 {
+    static_assert(K > 0, "KDTree needs at least one dimension");
+    static_assert(std::invocable<Acc const&, Val const&, std::size_t>,
+                  "Acc must be callable as acc(value, dim)");
+
 protected:
     using Base = AllocBase<Val, Alloc>;
-    using allocator_type = typename Base::allocator_type;
+    using AllocTraits = typename Base::AllocTraits;
 
     using BasePtr = NodeBase*;
     using BaseConstPtr = NodeBase const*;
@@ -153,6 +161,7 @@ protected:
     using NodeDimCompare = NodeDimensionComparator<Val, Acc, Cmp>;
 
 public:
+    using allocator_type = typename Base::allocator_type;
     //! Axis-aligned box for \ref countWithinRange, \ref findWithinRange, and \ref visitWithinRange.
     using Region = KdTreeRegion<K, Val, typename Acc::result_type, Acc, Cmp>;
     using value_type = Val;
@@ -162,153 +171,206 @@ public:
     using const_reference = value_type const&;
     using subvalue_type = typename Acc::result_type;
     using distance_type = typename Dist::distance_type;
-    using size_type = size_t;
-    using difference_type = ptrdiff_t;
+    using size_type = std::size_t;
+    using difference_type = std::ptrdiff_t;
 
-    //! Default constructor: empty tree, optional accessor, distance functor, comparator, allocator.
-    KDTree(Acc const& refAcc = Acc(), Dist const& refDist = Dist(),
-           Cmp const& refCmp = Cmp(),
-           const allocator_type& refAlloc = allocator_type())
-        : Base(refAlloc),
-          mHdr(),
-          mNodeCount(0),
-          mAcc(refAcc),
-          mCmp(refCmp),
-          mDist(refDist)
+    //! In-order iterator over values (bidirectional). There is no mutable iterator.
+    using const_iterator = TreeIterator<Val, const_reference, const_pointer>;
+    using iterator = const_iterator;
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+    using reverse_iterator = std::reverse_iterator<iterator>;
+
+    // --- construction / assignment ------------------------------------------
+
+    //! Empty tree with default-constructed functors and allocator.
+    KDTree() : Base(allocator_type()) {}
+
+    //! Empty tree with the given accessor, distance functor, comparator and allocator.
+    explicit KDTree(Acc const& refAcc, Dist const& refDist = Dist(),
+                    Cmp const& refCmp = Cmp(),
+                    const allocator_type& refAlloc = allocator_type())
+        : Base(refAlloc), mAcc(refAcc), mCmp(refCmp), mDist(refDist)
     {
-        initializeEmpty();
     }
 
-    //! Copy constructor: rebuilds an optimized tree from \p refRhs (bulk optimize, not per-insert).
+    //! Empty tree using \p refAlloc.
+    explicit KDTree(const allocator_type& refAlloc) : Base(refAlloc) {}
+
+    //! Copy constructor: builds a balanced tree holding copies of \p refRhs's elements.
     KDTree(const KDTree& refRhs)
-        : Base(refRhs.getAllocator()),
-          mHdr(),
-          mNodeCount(0),
+        : Base(AllocTraits::select_on_container_copy_construction(refRhs.mNodeAlloc)),
           mAcc(refRhs.mAcc),
           mCmp(refRhs.mCmp),
           mDist(refRhs.mDist)
     {
-        initializeEmpty();
-        // this is slow:
-        // this->insert(begin(), __x.begin(), __x.end());
-        // this->optimise();
+        std::vector<value_type> vecTemp(refRhs.begin(), refRhs.end());
+        buildBalanced<true>(vecTemp);
+    }
 
-        // this is much faster, as it skips a lot of useless work
-        // do the optimisation before inserting
-        // Needs to be stored in a vector first as optimize()
-        // sorts the data in the passed iterators directly.
-        std::vector<value_type> temp;
-        temp.reserve(refRhs.size());
-        std::copy(refRhs.begin(), refRhs.end(), std::back_inserter(temp));
-        optimize(temp.begin(), temp.end(), 0);
+    //! Move constructor: steals \p refRhs's nodes in O(1); \p refRhs is left empty.
+    KDTree(KDTree&& refRhs) noexcept
+        : Base(std::move(refRhs.mNodeAlloc)),
+          mAcc(std::move(refRhs.mAcc)),
+          mCmp(std::move(refRhs.mCmp)),
+          mDist(std::move(refRhs.mDist))
+    {
+        adopt(refRhs);
     }
 
     /**
-     * \brief Range constructor: copies \p [itFirst, itLast) into a temporary vector, then bulk-builds the tree.
-     * \tparam Iter Input iterator with `value_type` convertible to \c value_type.
-     * \note Iterators are read twice (for `distance` / `copy`); single-pass iterators are not supported.
+     * \brief Range constructor: bulk-builds a balanced tree from \p [itFirst, itLast).
+     * \tparam Iter Input iterator (single-pass iterators are supported).
      */
-    template <std::input_iterator Iter>
-    KDTree(Iter itFirst, Iter itLast,
+    template <std::input_iterator Iter, std::sentinel_for<Iter> Sent>
+    KDTree(Iter itFirst, Sent itLast,
            Acc const& refAcc = Acc(), Dist const& refDist = Dist(),
            Cmp const& refCmp = Cmp(),
            const allocator_type& refAlloc = allocator_type())
-        : Base(refAlloc),
-          mHdr(),
-          mNodeCount(0),
-          mAcc(refAcc),
-          mCmp(refCmp),
-          mDist(refDist)
+        : Base(refAlloc), mAcc(refAcc), mCmp(refCmp), mDist(refDist)
     {
-        initializeEmpty();
-        // this is slow:
-        // this->insert(begin(), __first, __last);
-        // this->optimise();
-
-        // this is much faster, as it skips a lot of useless work
-        // do the optimisation before inserting
-        // Needs to be stored in a vector first as optimize()
-        // sorts the data in the passed iterators directly.
-        std::vector<value_type> temp;
-        temp.reserve(std::distance(itFirst, itLast));
-        std::copy(itFirst, itLast, std::back_inserter(temp));
-        optimize(temp.begin(), temp.end(), 0);
-
-        // NOTE: this will BREAK users that are passing in
-        // read-once data via the iterator...
-        // We increment __first all the way to __last once within
-        // the distance() call, and again within the copy() call.
-        //
-        // This should end up using some funky C++ concepts or
-        // type traits to check that the iterators can be used in this way...
+        std::vector<value_type> vecTemp;
+        if constexpr (std::sized_sentinel_for<Sent, Iter>)
+            vecTemp.reserve(static_cast<size_type>(itLast - itFirst));
+        for (; itFirst != itLast; ++itFirst) vecTemp.emplace_back(*itFirst);
+        buildBalanced<true>(vecTemp);
     }
 
-    // this will CLEAR the tree and fill it with the contents
-    // of 'writable_vector'.  it will use the passed vector directly,
-    // and will basically resort the vector many times over while
-    // optimising the tree.
-    //
-    /**
-     * \brief Clears the tree and rebuilds it from \p vecWritable in place.
-     *
-     * The vector is reordered by the bulk \ref optimize routine (no extra copy).
-     * \post `vecWritable` contents are a permutation of the previous elements (same multiset).
-     */
-    void assignOptimized(
-        std::vector<value_type>& vecWritable)
+    //! Bulk-builds a balanced tree from an initializer list.
+    KDTree(std::initializer_list<value_type> lstInit,
+           Acc const& refAcc = Acc(), Dist const& refDist = Dist(),
+           Cmp const& refCmp = Cmp(),
+           const allocator_type& refAlloc = allocator_type())
+        : KDTree(lstInit.begin(), lstInit.end(), refAcc, refDist, refCmp, refAlloc)
     {
-        this->clear();
-        optimize(vecWritable.begin(), vecWritable.end(), 0);
     }
 
     KDTree& operator=(const KDTree& refRhs)
     {
         if (this != &refRhs) {
+            std::vector<value_type> vecTemp(refRhs.begin(), refRhs.end());
+            clear();
+            if constexpr (AllocTraits::propagate_on_container_copy_assignment::value)
+                this->mNodeAlloc = refRhs.mNodeAlloc;
             mAcc = refRhs.mAcc;
             mDist = refRhs.mDist;
             mCmp = refRhs.mCmp;
-            // this is slow:
-            // this->insert(begin(), __x.begin(), __x.end());
-            // this->optimise();
-
-            // this is much faster, as it skips a lot of useless work
-            // do the optimisation before inserting
-            // Needs to be stored in a vector first as optimize()
-            // sorts the data in the passed iterators directly.
-            std::vector<value_type> temp;
-            temp.reserve(refRhs.size());
-            std::copy(refRhs.begin(), refRhs.end(), std::back_inserter(temp));
-            assignOptimized(temp);
+            buildBalanced<true>(vecTemp);
         }
         return *this;
     }
 
+    KDTree& operator=(KDTree&& refRhs) noexcept(
+        AllocTraits::propagate_on_container_move_assignment::value ||
+        AllocTraits::is_always_equal::value)
+    {
+        if (this == &refRhs) return *this;
+        clear();
+        mAcc = std::move(refRhs.mAcc);
+        mDist = std::move(refRhs.mDist);
+        mCmp = std::move(refRhs.mCmp);
+        if constexpr (AllocTraits::propagate_on_container_move_assignment::value) {
+            this->mNodeAlloc = std::move(refRhs.mNodeAlloc);
+            adopt(refRhs);
+        } else if constexpr (AllocTraits::is_always_equal::value) {
+            adopt(refRhs);
+        } else if (this->mNodeAlloc == refRhs.mNodeAlloc) {
+            adopt(refRhs);
+        } else {
+            // Unequal, non-propagating allocators: move element-wise.
+            std::vector<value_type> vecTemp = refRhs.extractValues();
+            refRhs.clear();
+            buildBalanced<true>(vecTemp);
+        }
+        return *this;
+    }
+
+    KDTree& operator=(std::initializer_list<value_type> lstInit)
+    {
+        std::vector<value_type> vecTemp(lstInit);
+        clear();
+        buildBalanced<true>(vecTemp);
+        return *this;
+    }
+
     //! Destroys all nodes (\ref clear).
-    ~KDTree() { this->clear(); }
+    ~KDTree() { clear(); }
+
+    //! Swaps contents, functors and (if the allocator propagates on swap) allocators.
+    void swap(KDTree& refOther) noexcept
+    {
+        using std::swap;
+        if constexpr (AllocTraits::propagate_on_container_swap::value)
+            swap(this->mNodeAlloc, refOther.mNodeAlloc);
+        swap(mRoot, refOther.mRoot);
+        swap(mHdr.mLeft, refOther.mHdr.mLeft);
+        swap(mHdr.mRight, refOther.mHdr.mRight);
+        swap(mNodeCount, refOther.mNodeCount);
+        swap(mAcc, refOther.mAcc);
+        swap(mCmp, refOther.mCmp);
+        swap(mDist, refOther.mDist);
+        fixHeader();
+        refOther.fixHeader();
+    }
+
+    friend void swap(KDTree& refA, KDTree& refB) noexcept { refA.swap(refB); }
+
+    /**
+     * \brief Clears the tree and rebuilds it balanced from copies of \p vecWritable's elements.
+     *
+     * The vector is reordered by the median-split build (no extra copy of the vector).
+     * \post `vecWritable` contents are a permutation of the previous elements (same multiset).
+     */
+    void assignOptimized(std::vector<value_type>& vecWritable)
+    {
+        clear();
+        buildBalanced<false>(vecWritable);
+    }
+
+    //! As above, but moves the elements out of \p vecValues (left in a valid but unspecified state).
+    void assignOptimized(std::vector<value_type>&& vecValues)
+    {
+        clear();
+        buildBalanced<true>(vecValues);
+    }
+
+    // --- capacity / observers -----------------------------------------------
 
     //! Returns a copy of the node allocator.
-    allocator_type getAllocator() const { return Base::getAllocator(); }
+    [[nodiscard]] allocator_type getAllocator() const noexcept { return Base::getAllocator(); }
 
     //! Number of elements in the tree.
-    size_type size() const { return mNodeCount; }
+    [[nodiscard]] size_type size() const noexcept { return mNodeCount; }
 
-    //! Upper bound on container size (historical; effectively unbounded).
-    [[nodiscard]] size_type maxSize() const
+    //! Upper bound on container size.
+    [[nodiscard]] size_type maxSize() const noexcept
     {
         return std::numeric_limits<size_type>::max();
     }
 
     //! \c true if `size() == 0`.
-    bool empty() const { return this->size() == 0; }
+    [[nodiscard]] bool empty() const noexcept { return mNodeCount == 0; }
 
-    //! Removes all elements and resets the tree to empty.
-    void clear()
+    //! Removes all elements. O(n), iterative, no allocation.
+    void clear() noexcept
     {
-        eraseSubtree(root());
-        setLeftmost(&mHdr);
-        setRightmost(&mHdr);
-        setRoot(nullptr);
+        BasePtr pWalk = mRoot;
+        while (pWalk) {
+            if (pWalk->mLeft) {
+                pWalk = pWalk->mLeft;
+            } else if (pWalk->mRight) {
+                pWalk = pWalk->mRight;
+            } else {
+                BasePtr const pParent = pWalk->mParent;
+                if (pParent != &mHdr)
+                    (pParent->mLeft == pWalk ? pParent->mLeft : pParent->mRight) = nullptr;
+                this->deleteNode(static_cast<LinkType>(pWalk));
+                if (pParent == &mHdr) break;
+                pWalk = pParent;
+            }
+        }
+        mRoot = nullptr;
         mNodeCount = 0;
+        fixHeader();
     }
 
     /*! \brief Comparator for the values in the KDTree.
@@ -331,126 +393,114 @@ public:
       internal distance accumulation only (not tree layout).
       \return Reference to the distance functor.
      */
-    const Dist& valueDistance() const { return mDist; }
+    [[nodiscard]] const Dist& valueDistance() const noexcept { return mDist; }
 
     //! \copydoc valueDistance() const
-    Dist& valueDistance() { return mDist; }
+    [[nodiscard]] Dist& valueDistance() noexcept { return mDist; }
 
-    //! In-order iterator over values (bidirectional). There is no mutable iterator.
-    using const_iterator = TreeIterator<Val, const_reference, const_pointer>;
-    using iterator = const_iterator;
-    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
-    using reverse_iterator = std::reverse_iterator<iterator>;
+    // --- iteration ----------------------------------------------------------
 
-    //! Smallest element in tree order. Undefined if \ref empty (except matching \ref end).
-    const_iterator begin() const { return const_iterator(leftmost()); }
+    //! First element in tree (in-)order; equals \ref end when empty.
+    [[nodiscard]] const_iterator begin() const noexcept { return const_iterator(leftmost()); }
     //! Past-the-end iterator; must not be dereferenced.
-    const_iterator end() const
+    [[nodiscard]] const_iterator end() const noexcept
     {
         return const_iterator(static_cast<LinkConstType>(&mHdr));
     }
-    const_reverse_iterator rbegin() const
+    [[nodiscard]] const_iterator cbegin() const noexcept { return begin(); }
+    [[nodiscard]] const_iterator cend() const noexcept { return end(); }
+    [[nodiscard]] const_reverse_iterator rbegin() const noexcept
     {
         return const_reverse_iterator(end());
     }
-    const_reverse_iterator rend() const
+    [[nodiscard]] const_reverse_iterator rend() const noexcept
     {
         return const_reverse_iterator(begin());
     }
 
-    //! \copybrief insert(const_reference)
-    //! \param ignored Position hint (ignored; same as \ref insert(const_reference)).
-    iterator insert(iterator /* ignored */, const_reference refVal)
-    {
-        return this->insert(refVal);
-    }
+    // --- insertion ----------------------------------------------------------
 
     /**
      * \brief Inserts \p refVal and returns an iterator to the new node.
      * \complexity \f$O(\log n)\f$ typical depth; worst-case \f$O(n)\f$ for a degenerate tree.
      */
-    iterator insert(const_reference refVal)
+    iterator insert(const_reference refVal) { return linkNode(this->createNode(refVal)); }
+
+    //! Move-inserts \p refVal.
+    iterator insert(value_type&& refVal) { return linkNode(this->createNode(std::move(refVal))); }
+
+    //! Constructs a value in place from \p args and inserts it.
+    template <typename... Args>
+    iterator emplace(Args&&... args)
     {
-        if (!root()) {
-            LinkType pWalk = createNode(refVal, &mHdr);
-            ++mNodeCount;
-            setRoot(pWalk);
-            setLeftmost(pWalk);
-            setRightmost(pWalk);
-            return iterator(pWalk);
-        }
-        return insertNode(root(), refVal, 0);
+        return linkNode(this->createNode(std::forward<Args>(args)...));
     }
 
-    //! Inserts each element in \p [itFirst, itLast) via \ref insert(const_reference).
+    //! \copybrief insert(const_reference)
+    //! \param ignored Position hint (ignored; same as \ref insert(const_reference)).
+    iterator insert(iterator /* ignored */, const_reference refVal) { return insert(refVal); }
+
+    //! Inserts each element in \p [itFirst, itLast) one at a time (use \ref optimize afterwards to rebalance).
+    template <std::input_iterator Iter, std::sentinel_for<Iter> Sent>
+    void insert(Iter itFirst, Sent itLast)
+    {
+        for (; itFirst != itLast; ++itFirst) emplace(*itFirst);
+    }
+
+    //! Inserts every element of \p lstInit.
+    void insert(std::initializer_list<value_type> lstInit) { insert(lstInit.begin(), lstInit.end()); }
+
+    //! Inserts \p cDup copies of \p refValDup; \p itPos is ignored.
+    void insert(iterator /* itPos */, size_type cDup, const value_type& refValDup)
+    {
+        for (; cDup > 0; --cDup) insert(refValDup);
+    }
+
+    //! Inserts range \p [itFirst, itLast); \p itPos is ignored.
     template <std::input_iterator Iter>
-    void insert(Iter itFirst, Iter itLast)
+    void insert(iterator /* itPos */, Iter itFirst, Iter itLast)
     {
-        for (; itFirst != itLast; ++itFirst) this->insert(*itFirst);
+        insert(itFirst, itLast);
     }
 
-    //! Inserts \p cDup copies of \p refValDup; \p itPos is only passed through to \ref insert(iterator,const_reference).
-    void insert(iterator itPos, size_type cDup, const value_type& refValDup)
-    {
-        for (; cDup > 0; --cDup) this->insert(itPos, refValDup);
-    }
-
-    //! Inserts range \p [itFirst, itLast) at \p itPos (hint ignored per element).
-    template <std::input_iterator Iter>
-    void insert(iterator itPos, Iter itFirst, Iter itLast)
-    {
-        for (; itFirst != itLast; ++itFirst) this->insert(itPos, *itFirst);
-    }
+    // --- erase --------------------------------------------------------------
 
     /**
      * \brief Erases one element \ref find "equivalent" to \p refVal (same location in all dimensions).
-     *
-     * To remove a specific object (e.g. matching `operator==`), use \ref eraseExact.
+     * \return Number of elements removed (0 or 1).
      * \see find, eraseExact
      */
-    void erase(const_reference refVal)
+    size_type erase(const_reference refVal)
     {
-        const_iterator b = this->find(refVal);
-        this->erase(b);
+        const_iterator const it = find(refVal);
+        if (it == end()) return 0;
+        erase(it);
+        return 1;
     }
 
-    void eraseExact(const_reference refVal)
+    //! Erases one element `==` to \p refVal. \return Number of elements removed (0 or 1).
+    size_type eraseExact(const_reference refVal)
     {
-        this->erase(this->findExact(refVal));
+        const_iterator const it = findExact(refVal);
+        if (it == end()) return 0;
+        erase(it);
+        return 1;
     }
 
     /**
-     * \brief Erases the node referenced by \p itErase.
+     * \brief Erases the node referenced by \p itErase. Other iterators stay valid.
      * \pre `itErase != end()`.
      */
-    void erase(const_iterator const& itErase)
+    void erase(const_iterator const& itErase) noexcept
     {
-        assert(itErase != this->end());
-        LinkConstType target = itErase.node();
-        LinkConstType n = target;
-        size_type level = 0;
-        while ((n = parentOf(n)) != &mHdr) ++level;
-        LinkType const mutableTarget = asMutableNode(target);
-        erase(mutableTarget, level);
-        deleteNode(mutableTarget);
+        assert(itErase != end());
+        LinkType const pDead = asMutableNode(itErase.node());
+        unlinkNode(pDead, depthOf(pDead));
+        this->deleteNode(pDead);
         --mNodeCount;
     }
 
-    /* this does not work since erasure changes sort order
-          void
-          erase(const_iterator itRangeA, const_iterator const& itRangeB)
-          {
-            if (0 && itRangeA == this->begin() && itRangeB == this->end())
-              {
-                this->clear();
-              }
-            else
-              {
-                while (itRangeA != itRangeB)
-                  this->erase(itRangeA++);
-              }
-          }
-    */
+    // --- lookup -------------------------------------------------------------
 
     /**
      * \brief Finds any element with the same coordinates as \p refVal (all dimensions, via \c Cmp on accessor values).
@@ -459,10 +509,12 @@ public:
      * \see findExact
      */
     template <class SearchVal>
-    const_iterator find(SearchVal const& refVal) const
+    [[nodiscard]] const_iterator find(SearchVal const& refVal) const
     {
-        if (!root()) return this->end();
-        return find(root(), refVal, 0);
+        return toIterator(walkSubtree(
+            mRoot, 0, [&](LinkConstType n, std::size_t d) { return !lessOnAxis(n->mValue, refVal, d); },
+            [&](LinkConstType n, std::size_t d) { return !lessOnAxis(refVal, n->mValue, d); },
+            [&](LinkConstType n, size_type) { return matchesAllDims(n->mValue, refVal); }));
     }
 
     /**
@@ -470,31 +522,38 @@ public:
      *
      * Use when several stored values may share the same coordinates but differ otherwise
      * (e.g. distinct IDs). \ref find only matches by coordinate equivalence.
-     * \tparam SearchVal Typically \c value_type or compatible for `==`.
      */
     template <class SearchVal>
-    const_iterator findExact(SearchVal const& refVal) const
+    [[nodiscard]] const_iterator findExact(SearchVal const& refVal) const
     {
-        if (!root()) return this->end();
-        return findExact(root(), refVal, 0);
+        return toIterator(walkSubtree(
+            mRoot, 0, [&](LinkConstType n, std::size_t d) { return !lessOnAxis(n->mValue, refVal, d); },
+            [&](LinkConstType n, std::size_t d) { return !lessOnAxis(refVal, n->mValue, d); },
+            [&](LinkConstType n, size_type) { return n->mValue == refVal; }));
     }
 
-    //! Counts nodes inside the axis-aligned box centered at \p refVal with half-extent \p subR per axis (\ref findWithinRange "same metric").
-    size_type countWithinRange(const_reference refVal,
-                                 subvalue_type const subR) const
+    //! \c true if an element with the same coordinates as \p refVal exists.
+    template <class SearchVal>
+    [[nodiscard]] bool contains(SearchVal const& refVal) const
     {
-        if (!root()) return 0;
-        Region regRange(refVal, subR, mAcc, mCmp);
-        return this->countWithinRange(regRange);
+        return find(refVal) != end();
+    }
+
+    // --- range queries ------------------------------------------------------
+
+    //! Counts nodes inside the axis-aligned box centered at \p refVal with half-extent \p subR per axis (\ref findWithinRange "same metric").
+    template <typename SearchVal>
+    [[nodiscard]] size_type countWithinRange(SearchVal const& refVal, subvalue_type const subR) const
+    {
+        return countWithinRange(Region(refVal, subR, mAcc, mCmp));
     }
 
     //! Counts nodes inside an arbitrary axis-aligned \ref KdTreeRegion "region".
-    size_type countWithinRange(Region const& refRegion) const
+    [[nodiscard]] size_type countWithinRange(Region const& refRegion) const
     {
-        if (!root()) return 0;
-
-        Region regBounds(refRegion);
-        return countWithinRangeRecursive(root(), refRegion, regBounds, 0);
+        size_type count = 0;
+        forEachInRegion(refRegion, [&count](const_reference) { ++count; });
+        return count;
     }
 
     /**
@@ -502,21 +561,15 @@ public:
      * \return The visitor after traversal (for stateful functors).
      */
     template <typename SearchVal, class Visitor>
-    Visitor visitWithinRange(SearchVal const& V, subvalue_type const R,
-                               Visitor visitor) const
+    Visitor visitWithinRange(SearchVal const& V, subvalue_type const R, Visitor visitor) const
     {
-        if (!root()) return visitor;
-        Region region(V, R, mAcc, mCmp);
-        return this->visitWithinRange(region, visitor);
+        return visitWithinRange(Region(V, R, mAcc, mCmp), std::move(visitor));
     }
 
     template <class Visitor>
     Visitor visitWithinRange(Region const& REGION, Visitor visitor) const
     {
-        if (root()) {
-            Region bounds(REGION);
-            return visitWithinRangeRec(visitor, root(), REGION, bounds, 0);
-        }
+        forEachInRegion(REGION, [&visitor](const_reference v) { visitor(v); });
         return visitor;
     }
 
@@ -528,596 +581,529 @@ public:
      * \return Output iterator past the last written element.
      */
     template <typename SearchVal, typename OutputIterator>
-    OutputIterator findWithinRange(SearchVal const& val,
-                                      subvalue_type const range,
-                                      OutputIterator out) const
+    OutputIterator findWithinRange(SearchVal const& val, subvalue_type const range,
+                                   OutputIterator out) const
     {
-        if (!root()) return out;
-        Region region(val, range, mAcc, mCmp);
-        return this->findWithinRange(region, out);
+        return findWithinRange(Region(val, range, mAcc, mCmp), std::move(out));
     }
 
     template <typename OutputIterator>
-    OutputIterator findWithinRange(Region const& region,
-                                      OutputIterator out) const
+    OutputIterator findWithinRange(Region const& region, OutputIterator out) const
     {
-        if (root()) {
-            Region bounds(region);
-            out = findWithinRangeRec(out, root(), region, bounds, 0);
-        }
+        forEachInRegion(region, [&out](const_reference v) { *out++ = v; });
         return out;
     }
 
+    // --- nearest neighbour --------------------------------------------------
+
     /**
-     * \brief Nearest neighbor to \p refSearchVal in the Euclidean metric implied by \c Dist (default: sum of squared per-axis differences, square root returned).
+     * \brief Nearest neighbor to \p refSearchVal in the metric implied by \c Dist (default: Euclidean).
      * \return `{iterator, distance}` or `{end(), 0}` if the tree is empty.
      */
     template <class SearchVal>
-    std::pair<const_iterator, distance_type> findNearest(
+    [[nodiscard]] std::pair<const_iterator, distance_type> findNearest(
         SearchVal const& refSearchVal) const
     {
-        if (root()) {
-            std::pair<const TreeNode<Val>*, std::pair<size_type, distance_type>> best =
-                nodeNearest(
-                    K, 0, refSearchVal, root(), &mHdr, root(),
-                    accumulateNodeDistance(K, mDist, mAcc, root()->mValue,
-                                           refSearchVal),
-                    mCmp, mAcc, mDist, AlwaysTrue<value_type>());
-            return std::pair<const_iterator, distance_type>(best.first,
-                                                            best.second.second);
-        }
-        return std::pair<const_iterator, distance_type>(end(),
-                                                        distance_type(0));
+        return nearestImpl(refSearchVal, std::nullopt, AlwaysTrue<value_type>());
     }
 
     /**
-     * \brief Nearest neighbor within maximum Euclidean distance \p distMaxBound.
-     * \return Best pair inside the ball, or `{end(), distMaxBound}` if the root lies outside the ball
-     *         and no acceptable point exists (see implementation: unqualified root outside radius).
+     * \brief Nearest neighbor within maximum distance \p distMaxBound.
+     * \return Best pair inside the ball, or `{end(), distMaxBound}` if no element lies within it.
      */
     template <class SearchVal>
-    std::pair<const_iterator, distance_type> findNearest(
+    [[nodiscard]] std::pair<const_iterator, distance_type> findNearest(
         SearchVal const& refSearchVal, distance_type distMaxBound) const
     {
-        if (root()) {
-            bool rootIsCandidate = false;
-            const TreeNode<Val>* node = root();
-            distance_type const rootDistSq =
-                accumulateNodeDistance(K, mDist, mAcc, root()->mValue,
-                                       refSearchVal);
-            distance_type distSqInit = distMaxBound * distMaxBound;
-            distance_type const bound_sq = distMaxBound * distMaxBound;
-            if (rootDistSq <= bound_sq) {
-                rootIsCandidate = true;
-                distMaxBound = std::sqrt(rootDistSq);
-                distSqInit = rootDistSq;
-            }
-            std::pair<const TreeNode<Val>*, std::pair<size_type, distance_type>> best =
-                nodeNearest(K, 0, refSearchVal, root(), &mHdr,
-                            node, distSqInit, mCmp, mAcc, mDist,
-                            AlwaysTrue<value_type>());
-            // make sure we didn't just get stuck with the root node...
-            if (rootIsCandidate || best.first != root())
-                return std::pair<const_iterator, distance_type>(
-                    best.first, best.second.second);
-        }
-        return std::pair<const_iterator, distance_type>(end(), distMaxBound);
+        return nearestImpl(refSearchVal, distMaxBound, AlwaysTrue<value_type>());
     }
 
-    template <class SearchVal, class _Predicate>
-    std::pair<const_iterator, distance_type> findNearestIf(
-        SearchVal const& refSearchVal, distance_type distMaxBound, _Predicate fnPred) const
+    //! Nearest neighbor within \p distMaxBound among elements for which \p fnPred returns \c true.
+    template <class SearchVal, class Predicate>
+    [[nodiscard]] std::pair<const_iterator, distance_type> findNearestIf(
+        SearchVal const& refSearchVal, distance_type distMaxBound, Predicate fnPred) const
     {
-        if (root()) {
-            bool rootIsCandidate = false;
-            const TreeNode<Val>* node = root();
-            distance_type const rootDistSq =
-                accumulateNodeDistance(K, mDist, mAcc, root()->mValue,
-                                       refSearchVal);
-            distance_type distSqInit = distMaxBound * distMaxBound;
-            distance_type const bound_sq = distMaxBound * distMaxBound;
-            if (fnPred(root()->mValue) && rootDistSq <= bound_sq) {
-                rootIsCandidate = true;
-                distMaxBound = std::sqrt(rootDistSq);
-                distSqInit = rootDistSq;
-            }
-            std::pair<const TreeNode<Val>*, std::pair<size_type, distance_type>> best =
-                nodeNearest(K, 0, refSearchVal, root(), &mHdr, node,
-                            distSqInit, mCmp, mAcc, mDist, fnPred);
-            // make sure we didn't just get stuck with the root node...
-            if (rootIsCandidate || best.first != root())
-                return std::pair<const_iterator, distance_type>(
-                    best.first, best.second.second);
-        }
-        return std::pair<const_iterator, distance_type>(end(), distMaxBound);
+        return nearestImpl(refSearchVal, distMaxBound, fnPred);
     }
+
+    // --- maintenance --------------------------------------------------------
 
     /**
-     * \brief Rebuilds the tree to a balanced shape by copying into a vector and bulk-inserting via median splits.
-     * \complexity Approximately \f$O(n \log n)\f$.
+     * \brief Rebuilds the tree to a balanced shape (median split on every level).
+     * \complexity \f$O(n \log n)\f$. Elements are moved, not copied, when that cannot throw.
      */
     void optimize()
     {
-        std::vector<value_type> vecOptimise(this->begin(), this->end());
-        this->clear();
-        optimize(vecOptimise.begin(), vecOptimise.end(), 0);
+        std::vector<value_type> vecValues = extractValues();
+        clear();
+        buildBalanced<true>(vecValues);
     }
 
-    //! Debug: recursively \c assert tree ordering invariants (no-op in \c NDEBUG). Expensive.
-    void checkTreeInvariants() { checkNode(root(), 0); }
+    /**
+     * \brief Verifies every structural invariant (works in release builds).
+     *
+     * Checks the split ordering of every node against all of its ancestors, parent links,
+     * \ref size, and the cached leftmost / rightmost nodes. O(n) time, O(depth) memory.
+     * \return \c true if the tree is consistent.
+     */
+    bool checkTreeInvariants() const
+    {
+        if (!mRoot) return mNodeCount == 0 && leftmost() == &mHdr && rightmost() == &mHdr;
+        if (mRoot->mParent != &mHdr) return false;
+        if (leftmost() != NodeBase::Minimum(mRoot) || rightmost() != NodeBase::Maximum(mRoot))
+            return false;
+
+        // Each node must lie inside the box carved out by its ancestors' splits.
+        struct Frame {
+            LinkConstType node;
+            size_type depth;
+            std::array<LinkConstType, K> lo;  // nullptr = unbounded
+            std::array<LinkConstType, K> hi;
+        };
+        std::vector<Frame> stack;
+        stack.push_back(Frame{mRoot, 0, {}, {}});
+        size_type visited = 0;
+        while (!stack.empty()) {
+            Frame f = stack.back();
+            stack.pop_back();
+            ++visited;
+            for (std::size_t a = 0; a < K; ++a) {
+                if (f.lo[a] && lessOnAxis(f.node->mValue, f.lo[a]->mValue, a)) return false;
+                if (f.hi[a] && lessOnAxis(f.hi[a]->mValue, f.node->mValue, a)) return false;
+            }
+            std::size_t const axis = f.depth % K;
+            if (LinkConstType l = leftOf(f.node)) {
+                if (l->mParent != f.node) return false;
+                Frame c{l, f.depth + 1, f.lo, f.hi};
+                c.hi[axis] = f.node;
+                stack.push_back(c);
+            }
+            if (LinkConstType r = rightOf(f.node)) {
+                if (r->mParent != f.node) return false;
+                Frame c{r, f.depth + 1, f.lo, f.hi};
+                c.lo[axis] = f.node;
+                stack.push_back(c);
+            }
+        }
+        return visited == mNodeCount;
+    }
+
+    //! Height of the tree (0 when empty, 1 for a single node). O(n).
+    [[nodiscard]] size_type height() const
+    {
+        size_type best = 0;
+        walkSubtree(
+            mRoot, 0, [](LinkConstType, std::size_t) { return true; },
+            [](LinkConstType, std::size_t) { return true; },
+            [&best](LinkConstType, size_type d) {
+                best = std::max(best, d + 1);
+                return false;
+            });
+        return best;
+    }
 
 protected:
-    void checkChildren(LinkConstType child, LinkConstType parent,
-                           size_type const level, bool to_the_left)
+    // --- small helpers ------------------------------------------------------
+
+    static constexpr std::size_t nextAxis(std::size_t a) noexcept { return a + 1 == K ? 0 : a + 1; }
+    static constexpr std::size_t prevAxis(std::size_t a) noexcept { return a == 0 ? K - 1 : a - 1; }
+
+    template <typename A, typename B>
+    [[nodiscard]] bool lessOnAxis(A const& a, B const& b, std::size_t axis) const
     {
-        assert(parent);
-        if (child) {
-            NodeDimCompare Compare(level % K, mAcc, mCmp);
-            // REMEMBER! its a <= relationship for BOTH branches
-            // for left-case (true), child<=node --> !(node<child)
-            // for right-case (false), node<=child --> !(child<node)
-            assert(
-                !to_the_left ||
-                !Compare(parent->mValue, child->mValue));  // check the left
-            assert(to_the_left ||
-                   !Compare(child->mValue,
-                            parent->mValue));  // check the right
-            // and recurse down the tree, checking everything
-            checkChildren(leftOf(child), parent, level, to_the_left);
-            checkChildren(rightOf(child), parent, level, to_the_left);
-        }
+        return mCmp(mAcc(a, axis), mAcc(b, axis));
     }
 
-    void checkNode(LinkConstType node, size_type const level)
+    template <typename A, typename B>
+    [[nodiscard]] bool matchesAllDims(A const& a, B const& b) const
     {
-        if (node) {
-            // (comparing on this level)
-            // everything to the left of this node must be smaller than this
-            checkChildren(leftOf(node), node, level, true);
-            // everything to the right of this node must be larger than this
-            checkChildren(rightOf(node), node, level, false);
-
-            checkNode(leftOf(node), level + 1);
-            checkNode(rightOf(node), level + 1);
-        }
-    }
-
-    void initializeEmpty()
-    {
-        setLeftmost(&mHdr);
-        setRightmost(&mHdr);
-        mHdr.mParent = nullptr;
-        setRoot(nullptr);
-    }
-
-    iterator insertLeft(LinkType pNode, const_reference refVal)
-    {
-        setLeft(pNode, createNode(refVal));
-        ++mNodeCount;
-        setParent(leftOf(pNode), pNode);
-        if (pNode == leftmost()) setLeftmost(leftOf(pNode));
-        return iterator(leftOf(pNode));
-    }
-
-    iterator insertRight(LinkType pNode, const_reference refVal)
-    {
-        setRight(pNode, createNode(refVal));
-        ++mNodeCount;
-        setParent(rightOf(pNode), pNode);
-        if (pNode == rightmost()) setRightmost(rightOf(pNode));
-        return iterator(rightOf(pNode));
-    }
-
-    iterator insertNode(LinkType pNode, const_reference refVal, size_type const uLevel)
-    {
-        if (NodeDimCompare(uLevel % K, mAcc, mCmp)(refVal, pNode->mValue)) {
-            if (!leftOf(pNode)) return insertLeft(pNode, refVal);
-            return insertNode(leftOf(pNode), refVal, uLevel + 1);
-        } else {
-            if (!rightOf(pNode) || pNode == rightmost())
-                return insertRight(pNode, refVal);
-            return insertNode(rightOf(pNode), refVal, uLevel + 1);
-        }
-    }
-
-    LinkType erase(LinkType dead_dad, size_type const level)
-    {
-        // find a new step_dad, he will become a drop-in replacement.
-        LinkType step_dad = getEraseReplacement(dead_dad, level);
-
-        // tell dead_dad's parent that his new child is step_dad
-        if (dead_dad == root())
-            setRoot(step_dad);
-        else if (leftOf(parentOf(dead_dad)) == dead_dad)
-            setLeft(parentOf(dead_dad), step_dad);
-        else
-            setRight(parentOf(dead_dad), step_dad);
-
-        // deal with the left and right edges of the tree...
-        // if the dead_dad was at the edge, then substitude...
-        // but if there IS no new dead, then left_most is the dead_dad's parent
-        if (dead_dad == leftmost())
-            setLeftmost((step_dad ? step_dad : parentOf(dead_dad)));
-        if (dead_dad == rightmost())
-            setRightmost((step_dad ? step_dad : parentOf(dead_dad)));
-
-        if (step_dad) {
-            // step_dad gets dead_dad's parent
-            setParent(step_dad, parentOf(dead_dad));
-
-            // first tell the children that step_dad is their new dad
-            if (leftOf(dead_dad)) setParent(leftOf(dead_dad), step_dad);
-            if (rightOf(dead_dad)) setParent(rightOf(dead_dad), step_dad);
-
-            // step_dad gets dead_dad's children
-            setLeft(step_dad, leftOf(dead_dad));
-            setRight(step_dad, rightOf(dead_dad));
-        }
-
-        return step_dad;
-    }
-
-    LinkType getEraseReplacement(LinkType node, size_type const level)
-    {
-        // if 'node' is null, then we can't do any better
-        if (isLeaf(node)) return nullptr;
-
-        std::pair<LinkType, size_type> candidate;
-        // if there is nothing to the left, find a candidate on the right tree
-        if (!leftOf(node))
-            candidate = getJMin(
-                std::pair<LinkType, size_type>(rightOf(node), level),
-                level + 1);
-        // ditto for the right
-        else if ((!rightOf(node)))
-            candidate = getJMax(
-                std::pair<LinkType, size_type>(leftOf(node), level),
-                level + 1);
-        // we have both children ...
-        else {
-            // we need to do a little more work in order to find a good
-            // candidate this is actually a technique used to choose a node from
-            // either the left or right branch RANDOMLY, so that the tree has a
-            // greater change of staying balanced. If this were a true binary
-            // tree, we would always hunt down the right branch. See top for
-            // notes.
-            NodeDimCompare Compare(level % K, mAcc, mCmp);
-            // Compare the children based on this level's criteria...
-            // (this gives virtually random results)
-            if (Compare(rightOf(node)->mValue, leftOf(node)->mValue))
-                // the right is smaller, get our replacement from the SMALLEST
-                // on the right
-                candidate = getJMin(
-                    std::pair<LinkType, size_type>(rightOf(node), level),
-                    level + 1);
-            else
-                candidate = getJMax(
-                    std::pair<LinkType, size_type>(leftOf(node), level),
-                    level + 1);
-        }
-
-        // we have a candidate replacement by now.
-        // remove it from the tree, but don't delete it.
-        // it must be disconnected before it can be reconnected.
-        LinkType parent = parentOf(candidate.first);
-        if (leftOf(parent) == candidate.first)
-            setLeft(parent, erase(candidate.first, candidate.second));
-        else
-            setRight(parent, erase(candidate.first, candidate.second));
-
-        return candidate.first;
-    }
-
-    std::pair<LinkType, size_type> getJMin(
-        std::pair<LinkType, size_type> const node, size_type const level)
-    {
-        using Result = std::pair<LinkType, size_type>;
-        if (isLeaf(node.first)) return Result(node.first, level);
-
-        NodeDimCompare Compare(node.second % K, mAcc, mCmp);
-        Result candidate = node;
-        if (leftOf(node.first)) {
-            Result left = getJMin(Result(leftOf(node.first), node.second),
-                                       level + 1);
-            if (Compare(left.first->mValue, candidate.first->mValue))
-                candidate = left;
-        }
-        if (rightOf(node.first)) {
-            Result right = getJMin(
-                Result(rightOf(node.first), node.second), level + 1);
-            if (Compare(right.first->mValue, candidate.first->mValue))
-                candidate = right;
-        }
-        if (candidate.first == node.first)
-            return {candidate.first, level};
-
-        return candidate;
-    }
-
-    std::pair<LinkType, size_type> getJMax(
-        std::pair<LinkType, size_type> const node, size_type const level)
-    {
-        using Result = std::pair<LinkType, size_type>;
-
-        if (isLeaf(node.first)) return Result(node.first, level);
-
-        NodeDimCompare Compare(node.second % K, mAcc, mCmp);
-        Result candidate = node;
-        if (leftOf(node.first)) {
-            Result left = getJMax(Result(leftOf(node.first), node.second),
-                                       level + 1);
-            if (Compare(candidate.first->mValue, left.first->mValue))
-                candidate = left;
-        }
-        if (rightOf(node.first)) {
-            Result right = getJMax(
-                Result(rightOf(node.first), node.second), level + 1);
-            if (Compare(candidate.first->mValue, right.first->mValue))
-                candidate = right;
-        }
-
-        if (candidate.first == node.first)
-            return {candidate.first, level};
-
-        return candidate;
-    }
-
-    void eraseSubtree(LinkType pWalk)
-    {
-        while (pWalk) {
-            eraseSubtree(rightOf(pWalk));
-            LinkType pLeftHold = leftOf(pWalk);
-            deleteNode(pWalk);
-            pWalk = pLeftHold;
-        }
-    }
-
-    const_iterator find(LinkConstType node, const_reference value,
-                           size_type const level) const
-    {
-        // be aware! This is very different to normal binary searches, because
-        // of the <= relationship used. See top for notes. Basically we have to
-        // check ALL branches, as we may have an identical node in different
-        // branches.
-        const_iterator found = this->end();
-
-        NodeDimCompare Compare(level % K, mAcc, mCmp);
-        if (!Compare(node->mValue, value))  // note, this is a <= test
-        {
-            // this line is the only difference between findExact() and
-            // find()
-            if (matchesNode(node, value, level))
-                return const_iterator(node);  // return right away
-            if (leftOf(node)) found = find(leftOf(node), value, level + 1);
-        }
-        if (rightOf(node) && found == this->end() &&
-            !Compare(value, node->mValue))  // note, this is a <= test
-            found = find(rightOf(node), value, level + 1);
-        return found;
-    }
-
-    const_iterator findExact(LinkConstType node, const_reference value,
-                                 size_type const level) const
-    {
-        // be aware! This is very different to normal binary searches, because
-        // of the <= relationship used. See top for notes. Basically we have to
-        // check ALL branches, as we may have an identical node in different
-        // branches.
-        const_iterator found = this->end();
-
-        NodeDimCompare Compare(level % K, mAcc, mCmp);
-        if (!Compare(node->mValue, value))  // note, this is a <= test
-        {
-            // this line is the only difference between findExact() and
-            // find()
-            if (value == *const_iterator(node))
-                return const_iterator(node);  // return right away
-            if (leftOf(node))
-                found = findExact(leftOf(node), value, level + 1);
-        }
-
-        // note: no else!  items that are identical can be down both branches
-        if (rightOf(node) && found == this->end() &&
-            !Compare(value, node->mValue))  // note, this is a <= test
-            found = findExact(rightOf(node), value, level + 1);
-        return found;
-    }
-
-    bool matchesNodeInDimension(LinkConstType pNode, const_reference refVal,
-                              size_type const uLevel) const
-    {
-        NodeDimCompare Compare(uLevel % K, mAcc, mCmp);
-        return !(Compare(pNode->mValue, refVal) || Compare(refVal, pNode->mValue));
-    }
-
-    bool matchesNodeInOtherDims(LinkConstType pNode, const_reference refVal,
-                                     size_type const uLevel = 0) const
-    {
-        size_type uDimIdx = uLevel;
-        while ((uDimIdx = (uDimIdx + 1) % K) != uLevel % K)
-            if (!matchesNodeInDimension(pNode, refVal, uDimIdx)) return false;
+        for (std::size_t d = 0; d < K; ++d)
+            if (lessOnAxis(a, b, d) || lessOnAxis(b, a, d)) return false;
         return true;
     }
 
-    bool matchesNode(LinkConstType pNode, const_reference refVal,
-                         size_type uLevel = 0) const
+    [[nodiscard]] const_iterator toIterator(LinkConstType pNode) const noexcept
     {
-        return matchesNodeInDimension(pNode, refVal, uLevel) &&
-               matchesNodeInOtherDims(pNode, refVal, uLevel);
+        return pNode ? const_iterator(pNode) : end();
     }
 
-    size_type countWithinRangeRecursive(LinkConstType pNode,
-                                    Region const& refRegion,
-                                    Region const& refBounds,
-                                    size_type const uLevel) const
+    void fixHeader() noexcept
     {
-        size_type count = 0;
-        if (refRegion.encloses(nodeValue(pNode))) {
-            ++count;
+        mHdr.mParent = nullptr;
+        if (mRoot) {
+            mRoot->mParent = &mHdr;
+        } else {
+            mHdr.mLeft = &mHdr;
+            mHdr.mRight = &mHdr;
         }
-        if (leftOf(pNode)) {
-            Region regBounds(refBounds);
-            regBounds.setHighBound(nodeValue(pNode), uLevel);
-            if (refRegion.intersectsWith(regBounds))
-                count += countWithinRangeRecursive(leftOf(pNode), refRegion, regBounds,
-                                               uLevel + 1);
-        }
-        if (rightOf(pNode)) {
-            Region regBounds(refBounds);
-            regBounds.setLowBound(nodeValue(pNode), uLevel);
-            if (refRegion.intersectsWith(regBounds))
-                count += countWithinRangeRecursive(rightOf(pNode), refRegion,
-                                               regBounds, uLevel + 1);
-        }
-
-        return count;
     }
 
-    template <class Visitor>
-    Visitor visitWithinRangeRec(Visitor visitor, LinkConstType N,
-                                  Region const& REGION,
-                                  Region const& BOUNDS,
-                                  size_type const L) const
+    void refreshExtremes() noexcept
     {
-        if (REGION.encloses(nodeValue(N))) {
-            visitor(nodeValue(N));
+        if (mRoot) {
+            mHdr.mLeft = NodeBase::Minimum(mRoot);
+            mHdr.mRight = NodeBase::Maximum(mRoot);
+        } else {
+            fixHeader();
         }
-        if (leftOf(N)) {
-            Region bounds(BOUNDS);
-            bounds.setHighBound(nodeValue(N), L);
-            if (REGION.intersectsWith(bounds))
-                visitor = visitWithinRangeRec(visitor, leftOf(N), REGION,
-                                                bounds, L + 1);
-        }
-        if (rightOf(N)) {
-            Region bounds(BOUNDS);
-            bounds.setLowBound(nodeValue(N), L);
-            if (REGION.intersectsWith(bounds))
-                visitor = visitWithinRangeRec(visitor, rightOf(N), REGION,
-                                                bounds, L + 1);
-        }
-
-        return visitor;
     }
 
-    template <typename OutputIterator>
-    OutputIterator findWithinRangeRec(OutputIterator out,
-                                         LinkConstType pNode,
-                                         Region const& refRegion,
-                                         Region const& refBounds,
-                                         size_type const uLevel) const
+    //! Takes ownership of \p refRhs's nodes. \pre `*this` is empty.
+    void adopt(KDTree& refRhs) noexcept
     {
-        if (refRegion.encloses(nodeValue(pNode))) {
-            *out++ = nodeValue(pNode);
-        }
-        if (leftOf(pNode)) {
-            Region regBounds(refBounds);
-            regBounds.setHighBound(nodeValue(pNode), uLevel);
-            if (refRegion.intersectsWith(regBounds))
-                out = findWithinRangeRec(out, leftOf(pNode), refRegion,
-                                           regBounds, uLevel + 1);
-        }
-        if (rightOf(pNode)) {
-            Region regBounds(refBounds);
-            regBounds.setLowBound(nodeValue(pNode), uLevel);
-            if (refRegion.intersectsWith(regBounds))
-                out = findWithinRangeRec(out, rightOf(pNode), refRegion,
-                                           regBounds, uLevel + 1);
-        }
-
-        return out;
+        mRoot = refRhs.mRoot;
+        mNodeCount = refRhs.mNodeCount;
+        mHdr.mLeft = refRhs.mHdr.mLeft;
+        mHdr.mRight = refRhs.mHdr.mRight;
+        fixHeader();
+        refRhs.mRoot = nullptr;
+        refRhs.mNodeCount = 0;
+        refRhs.fixHeader();
     }
 
-    //! \internal Bulk-build: `nth_element` median split, recursive; reorders \p [itRangeA, itRangeB).
-    template <std::random_access_iterator Iter>
-    void optimize(Iter const& itRangeA, Iter const& itRangeB, size_type const uLevel)
+    //! Moves (or copies, if moving could throw) every stored value into a vector.
+    std::vector<value_type> extractValues()
     {
-        if (itRangeA == itRangeB) return;
-        NodeDimCompare Compare(uLevel % K, mAcc, mCmp);
-        Iter itMid = itRangeA + (itRangeB - itRangeA) / 2;
-        std::nth_element(itRangeA, itMid, itRangeB, Compare);
-        this->insert(*itMid);
-        if (itMid != itRangeA) optimize(itRangeA, itMid, uLevel + 1);
-        if (++itMid != itRangeB) optimize(itMid, itRangeB, uLevel + 1);
+        std::vector<value_type> vecValues;
+        vecValues.reserve(mNodeCount);
+        for (auto it = begin(); it != end(); ++it)
+            vecValues.push_back(std::move_if_noexcept(asMutableNode(it.node())->mValue));
+        return vecValues;
     }
 
-    LinkConstType root() const { return mRoot; }
+    /**
+     * \internal
+     * \brief Pre-order walk of the subtree at \p pTop using parent links (no recursion, no allocation).
+     *
+     * \param goLeft  `bool(node, axis)`: descend into the left child?
+     * \param goRight `bool(node, axis)`: descend into the right child?
+     * \param visit   `bool(node, depth)`: return \c true to stop; that node is returned.
+     * \return The node at which \p visit stopped, or \c nullptr.
+     */
+    template <class GoLeft, class GoRight, class Visit>
+    LinkConstType walkSubtree(LinkConstType pTop, size_type depth, GoLeft&& goLeft,
+                              GoRight&& goRight, Visit&& visit) const
+    {
+        if (!pTop) return nullptr;
+        LinkConstType n = pTop;
+        std::size_t axis = depth % K;
+        for (;;) {
+            if (visit(n, depth)) return n;
+            if (n->mLeft && goLeft(n, axis)) {
+                n = leftOf(n);
+            } else if (n->mRight && goRight(n, axis)) {
+                n = rightOf(n);
+            } else {
+                // climb until an unexplored right sibling subtree is wanted
+                for (;;) {
+                    if (n == pTop) return nullptr;
+                    LinkConstType const p = parentOf(n);
+                    --depth;
+                    axis = prevAxis(axis);
+                    if (n == p->mLeft && p->mRight && goRight(p, axis)) {
+                        n = rightOf(p);
+                        break;
+                    }
+                    n = p;
+                }
+            }
+            ++depth;
+            axis = nextAxis(axis);
+        }
+    }
 
-    LinkType root() { return mRoot; }
+    //! Calls \p fn on every value inside \p region; prunes subtrees on the split axis.
+    template <class Fn>
+    void forEachInRegion(Region const& region, Fn&& fn) const
+    {
+        if (mRoot) regionRecurse(mRoot, 0, kMaxRecursion, region, fn);
+    }
 
-    void setRoot(LinkType pNode) { mRoot = pNode; }
+    //! Recursion depth after which range queries switch to the (slightly slower) iterative walk.
+    static constexpr size_type kMaxRecursion = 128;
 
-    LinkConstType leftmost() const
+    // left subtree holds values <= node on its axis; right subtree holds values >= node
+    [[nodiscard]] bool regionGoLeft(Region const& region, LinkConstType n, std::size_t axis) const
+    {
+        return !region.mComparator(mAcc(n->mValue, axis), region.mSubLow[axis]);
+    }
+    [[nodiscard]] bool regionGoRight(Region const& region, LinkConstType n, std::size_t axis) const
+    {
+        return !region.mComparator(region.mSubHigh[axis], mAcc(n->mValue, axis));
+    }
+
+    // Recursion is a little faster than climbing parent links; depth is capped so a
+    // degenerate tree falls back to walkSubtree instead of overflowing the stack.
+    template <class Fn>
+    void regionRecurse(LinkConstType n, std::size_t axis, size_type budget, Region const& region,
+                       Fn& fn) const
+    {
+        if (budget == 0) {
+            walkSubtree(
+                n, axis,
+                [&](LinkConstType p, std::size_t a) { return regionGoLeft(region, p, a); },
+                [&](LinkConstType p, std::size_t a) { return regionGoRight(region, p, a); },
+                [&](LinkConstType p, size_type) {
+                    if (region.encloses(p->mValue)) fn(p->mValue);
+                    return false;
+                });
+            return;
+        }
+        if (region.encloses(n->mValue)) fn(n->mValue);
+        std::size_t const next = nextAxis(axis);
+        if (n->mLeft && regionGoLeft(region, n, axis))
+            regionRecurse(leftOf(n), next, budget - 1, region, fn);
+        if (n->mRight && regionGoRight(region, n, axis))
+            regionRecurse(rightOf(n), next, budget - 1, region, fn);
+    }
+
+    template <class SearchVal, class Predicate>
+    std::pair<const_iterator, distance_type> nearestImpl(
+        SearchVal const& refSearchVal, std::optional<distance_type> optBound, Predicate fnPred) const
+    {
+        if (!mRoot) return {end(), optBound.value_or(distance_type(0))};
+
+        distance_type const rootDistSq =
+            accumulateNodeDistance(K, mDist, mAcc, mRoot->mValue, refSearchVal);
+        distance_type distSqInit = rootDistSq;
+        bool rootIsCandidate = true;
+        if (optBound) {
+            distance_type const boundSq = *optBound * *optBound;
+            rootIsCandidate = fnPred(mRoot->mValue) && rootDistSq <= boundSq;
+            if (!rootIsCandidate) distSqInit = boundSq;
+        }
+        auto const best = nodeNearest<K>(0, refSearchVal, mRoot, &mHdr, mRoot, distSqInit,
+                                         mCmp, mAcc, mDist, fnPred);
+        // make sure we didn't just get stuck with the (unqualified) root node
+        if (rootIsCandidate || best.first != mRoot)
+            return {const_iterator(best.first), best.second.second};
+        return {end(), *optBound};
+    }
+
+    // --- structural modification --------------------------------------------
+
+    //! Links a freshly created node into the tree (iterative descent).
+    iterator linkNode(LinkType pNew) noexcept
+    {
+        ++mNodeCount;
+        if (!mRoot) {
+            mRoot = pNew;
+            pNew->mParent = &mHdr;
+            mHdr.mLeft = mHdr.mRight = pNew;
+            return iterator(pNew);
+        }
+        LinkType p = mRoot;
+        std::size_t axis = 0;
+        for (;;) {
+            if (lessOnAxis(pNew->mValue, p->mValue, axis)) {
+                if (!p->mLeft) {
+                    p->mLeft = pNew;
+                    if (p == leftmost()) mHdr.mLeft = pNew;
+                    break;
+                }
+                p = leftOf(p);
+            } else {
+                if (!p->mRight) {
+                    p->mRight = pNew;
+                    if (p == rightmost()) mHdr.mRight = pNew;
+                    break;
+                }
+                p = rightOf(p);
+            }
+            axis = nextAxis(axis);
+        }
+        pNew->mParent = p;
+        return iterator(pNew);
+    }
+
+    /**
+     * \internal
+     * \brief Builds a balanced tree from \p vecValues (median split per level). \pre empty tree.
+     * \tparam MoveValues Move elements out of \p vecValues instead of copying them.
+     * Strong-ish guarantee: on exception the tree is left empty.
+     */
+    template <bool MoveValues>
+    void buildBalanced(std::vector<value_type>& vecValues)
+    {
+        assert(!mRoot);
+        if (vecValues.empty()) return;
+        try {
+            buildRange<MoveValues>(vecValues.begin(), vecValues.end(), 0, &mHdr, false);
+        } catch (...) {
+            clear();
+            throw;
+        }
+        refreshExtremes();
+    }
+
+    // Recursion depth is ceil(log2(n)) – the tree being built is balanced.
+    // Each node is linked in as soon as it exists, so clear() can always clean up.
+    template <bool MoveValues, std::random_access_iterator Iter>
+    void buildRange(Iter itFirst, Iter itLast, std::size_t axis, BasePtr pParent, bool bLeft)
+    {
+        while (itFirst != itLast) {
+            Iter const itMid = itFirst + (itLast - itFirst) / 2;
+            std::nth_element(itFirst, itMid, itLast, NodeDimCompare(axis, mAcc, mCmp));
+            LinkType pNode;
+            if constexpr (MoveValues)
+                pNode = this->createNode(std::move(*itMid));
+            else
+                pNode = this->createNode(std::as_const(*itMid));
+            pNode->mParent = pParent;
+            if (pParent == &mHdr)
+                mRoot = pNode;
+            else
+                (bLeft ? pParent->mLeft : pParent->mRight) = pNode;
+            ++mNodeCount;
+            std::size_t const next = nextAxis(axis);
+            buildRange<MoveValues>(itFirst, itMid, next, pNode, true);
+            // tail-iterate on the right half
+            itFirst = itMid + 1;
+            axis = next;
+            pParent = pNode;
+            bLeft = false;
+        }
+    }
+
+    [[nodiscard]] size_type depthOf(BaseConstPtr pNode) const noexcept
+    {
+        size_type level = 0;
+        while ((pNode = pNode->mParent) != &mHdr) ++level;
+        return level;
+    }
+
+    //! Node with the smallest coordinate on \p dim in the subtree at \p pTop (depth \p depth).
+    std::pair<LinkType, size_type> findMinOnAxis(LinkConstType pTop, size_type depth,
+                                                 std::size_t dim) const
+    {
+        std::pair<LinkConstType, size_type> best{pTop, depth};
+        walkSubtree(
+            pTop, depth, [](LinkConstType, std::size_t) { return true; },
+            // right subtree of a node split on `dim` can't hold anything smaller
+            [dim](LinkConstType, std::size_t a) { return a != dim; },
+            [&](LinkConstType n, size_type d) {
+                if (lessOnAxis(n->mValue, best.first->mValue, dim)) best = {n, d};
+                return false;
+            });
+        return {asMutableNode(best.first), best.second};
+    }
+
+    //! Node with the largest coordinate on \p dim in the subtree at \p pTop (depth \p depth).
+    std::pair<LinkType, size_type> findMaxOnAxis(LinkConstType pTop, size_type depth,
+                                                 std::size_t dim) const
+    {
+        std::pair<LinkConstType, size_type> best{pTop, depth};
+        walkSubtree(
+            pTop, depth, [dim](LinkConstType, std::size_t a) { return a != dim; },
+            [](LinkConstType, std::size_t) { return true; },
+            [&](LinkConstType n, size_type d) {
+                if (lessOnAxis(best.first->mValue, n->mValue, dim)) best = {n, d};
+                return false;
+            });
+        return {asMutableNode(best.first), best.second};
+    }
+
+    //! Points whichever link refers to \p pOld (parent's child slot or the root) at \p pNew.
+    void replaceChildLink(BasePtr pParent, BasePtr pOld, BasePtr pNew) noexcept
+    {
+        if (pParent == &mHdr)
+            mRoot = static_cast<LinkType>(pNew);
+        else if (pParent->mLeft == pOld)
+            pParent->mLeft = pNew;
+        else
+            pParent->mRight = pNew;
+    }
+
+    //! Exchanges the tree positions of \p a and its descendant \p b (values stay in their nodes).
+    void swapPositions(LinkType a, LinkType b) noexcept
+    {
+        BasePtr const ap = a->mParent, al = a->mLeft, ar = a->mRight;
+        BasePtr const bp = b->mParent, bl = b->mLeft, br = b->mRight;
+        replaceChildLink(ap, a, b);
+        b->mParent = ap;
+        if (bp == a) {
+            if (al == b) {
+                b->mLeft = a;
+                b->mRight = ar;
+                if (ar) ar->mParent = b;
+            } else {
+                b->mRight = a;
+                b->mLeft = al;
+                if (al) al->mParent = b;
+            }
+            a->mParent = b;
+        } else {
+            (bp->mLeft == b ? bp->mLeft : bp->mRight) = a;
+            b->mLeft = al;
+            b->mRight = ar;
+            if (al) al->mParent = b;
+            if (ar) ar->mParent = b;
+            a->mParent = bp;
+        }
+        a->mLeft = bl;
+        a->mRight = br;
+        if (bl) bl->mParent = a;
+        if (br) br->mParent = a;
+    }
+
+    /**
+     * \internal
+     * \brief Detaches \p pDead (at depth \p depth) from the tree, keeping all invariants.
+     *
+     * The node is repeatedly swapped with a replacement from its subtree – the minimum of the
+     * right subtree or the maximum of the left subtree on its split axis – until it is a leaf,
+     * then cut off. Iterative; no allocation.
+     */
+    void unlinkNode(LinkType pDead, size_type depth) noexcept
+    {
+        while (!isLeaf(pDead)) {
+            std::size_t const dim = depth % K;
+            LinkConstType const l = leftOf(pDead);
+            LinkConstType const r = rightOf(pDead);
+            std::pair<LinkType, size_type> repl;
+            if (!l)
+                repl = findMinOnAxis(r, depth + 1, dim);
+            else if (!r)
+                repl = findMaxOnAxis(l, depth + 1, dim);
+            else if (lessOnAxis(r->mValue, l->mValue, dim))
+                // children compare "backwards": effectively a coin flip that keeps the tree balanced
+                repl = findMinOnAxis(r, depth + 1, dim);
+            else
+                repl = findMaxOnAxis(l, depth + 1, dim);
+            swapPositions(pDead, repl.first);
+            depth = repl.second;
+        }
+        replaceChildLink(pDead->mParent, pDead, nullptr);
+        refreshExtremes();
+    }
+
+    // --- raw link accessors -------------------------------------------------
+
+    [[nodiscard]] LinkConstType leftmost() const noexcept
     {
         return static_cast<LinkConstType>(mHdr.mLeft);
     }
-
-    void setLeftmost(NodeBase* a) { mHdr.mLeft = a; }
-
-    LinkConstType rightmost() const
+    [[nodiscard]] LinkConstType rightmost() const noexcept
     {
         return static_cast<LinkConstType>(mHdr.mRight);
     }
 
-    void setRightmost(NodeBase* a) { mHdr.mRight = a; }
-
-    static LinkType parentOf(BasePtr N)
-    {
-        return static_cast<LinkType>(N->mParent);
-    }
-
-    static LinkConstType parentOf(BaseConstPtr N)
+    static LinkType parentOf(BasePtr N) noexcept { return static_cast<LinkType>(N->mParent); }
+    static LinkConstType parentOf(BaseConstPtr N) noexcept
     {
         return static_cast<LinkConstType>(N->mParent);
     }
-
-    static void setParent(BasePtr N, BasePtr p) { N->mParent = p; }
-
-    static void setLeft(BasePtr N, BasePtr l) { N->mLeft = l; }
-
-    static LinkType leftOf(BasePtr N)
-    {
-        return static_cast<LinkType>(N->mLeft);
-    }
-
-    static LinkConstType leftOf(BaseConstPtr N)
+    static LinkType leftOf(BasePtr N) noexcept { return static_cast<LinkType>(N->mLeft); }
+    static LinkConstType leftOf(BaseConstPtr N) noexcept
     {
         return static_cast<LinkConstType>(N->mLeft);
     }
-
-    static void setRight(BasePtr N, BasePtr r) { N->mRight = r; }
-
-    static LinkType rightOf(BasePtr N)
-    {
-        return static_cast<LinkType>(N->mRight);
-    }
-
-    static LinkConstType rightOf(BaseConstPtr N)
+    static LinkType rightOf(BasePtr N) noexcept { return static_cast<LinkType>(N->mRight); }
+    static LinkConstType rightOf(BaseConstPtr N) noexcept
     {
         return static_cast<LinkConstType>(N->mRight);
     }
-
-    static bool isLeaf(BaseConstPtr N)
-    {
-        return !leftOf(N) && !rightOf(N);
-    }
-
-    static const_reference nodeValue(LinkConstType N) { return N->mValue; }
-
-    static const_reference nodeValue(BaseConstPtr N)
-    {
-        return static_cast<LinkConstType>(N)->mValue;
-    }
-
-    static LinkConstType Minimum(LinkConstType pNodeEnd)
-    {
-        return static_cast<LinkConstType>(NodeBase::Minimum(pNodeEnd));
-    }
-
-    static LinkConstType Maximum(LinkConstType pNodeEnd)
-    {
-        return static_cast<LinkConstType>(NodeBase::Maximum(pNodeEnd));
-    }
+    static bool isLeaf(BaseConstPtr N) noexcept { return !N->mLeft && !N->mRight; }
 
     //! Single place for const-to-mutable node pointer when the tree owns the node (erase, delete).
     static LinkType asMutableNode(LinkConstType pNode) noexcept
@@ -1125,69 +1111,30 @@ protected:
         return const_cast<LinkType>(pNode);
     }
 
-    LinkType createNode(const_reference refVal,  //  = value_type(),
-                           BasePtr const pParentArg = nullptr,
-                           BasePtr const pLeftArg = nullptr,
-                           BasePtr const pRightArg = nullptr)
-    {
-        typename Base::NoLeakAlloc allocGuard(this);
-        LinkType pNewNode = allocGuard.get();
-        Base::constructNode(pNewNode, refVal, pParentArg, pLeftArg, pRightArg);
-        allocGuard.disconnect();
-        return pNewNode;
-    }
-
-    /* WHAT was this for?
-    LinkType
-    cloneNode(LinkConstType pNodeEnd)
-    {
-      LinkType pAllocated = allocateNode(pNodeEnd->mValue);
-      // TODO
-      return pAllocated;
-    }
-    */
-
-    void deleteNode(LinkType pNode)
-    {
-        Base::destroyNode(pNode);
-        Base::deallocateNode(pNode);
-    }
-
-    LinkType mRoot;
-    NodeBase mHdr;
-    size_type mNodeCount;
-    Acc mAcc;
-    Cmp mCmp;
-    Dist mDist;
+    LinkType mRoot = nullptr;
+    NodeBase mHdr{nullptr, &mHdr, &mHdr};  //!< Sentinel: mLeft = leftmost, mRight = rightmost.
+    size_type mNodeCount = 0;
+    KDTREE_NO_UNIQUE_ADDRESS Acc mAcc{};
+    KDTREE_NO_UNIQUE_ADDRESS Cmp mCmp{};
+    KDTREE_NO_UNIQUE_ADDRESS Dist mDist{};
 
 #ifdef KDTREE_DEFINE_OSTREAM_OPERATORS
-    friend std::ostream& operator<<(
-        std::ostream& o,
-        KDTree<K, Val, Acc, Dist, Cmp, Alloc> const& tree)
+    friend std::ostream& operator<<(std::ostream& o, KDTree const& tree)
     {
-        o << "meta node:   " << tree.mHdr << std::endl;
-        o << "root node:   " << tree.mRoot << std::endl;
+        o << "meta node:   " << tree.mHdr << '\n';
+        o << "root node:   " << tree.mRoot << '\n';
 
-        if (tree.empty())
-            return o << "[empty " << K << "d-tree " << &tree << "]";
+        if (tree.empty()) return o << "[empty " << K << "d-tree " << &tree << "]";
 
-        o << "nodes total: " << tree.size() << std::endl;
-        o << "dimensions:  " << K << std::endl;
-
-        using _Tree = KDTree<K, Val, Acc, Dist, Cmp, Alloc>;
-        using LinkType = typename _Tree::LinkType;
-
-        std::stack<LinkConstType> s;
-        s.push(tree.root());
-
-        while (!s.empty()) {
-            LinkConstType n = s.top();
-            s.pop();
-            o << *n << std::endl;
-            if (_Tree::leftOf(n)) s.push(_Tree::leftOf(n));
-            if (_Tree::rightOf(n)) s.push(_Tree::rightOf(n));
-        }
-
+        o << "nodes total: " << tree.size() << '\n';
+        o << "dimensions:  " << K << '\n';
+        tree.walkSubtree(
+            tree.mRoot, 0, [](LinkConstType, std::size_t) { return true; },
+            [](LinkConstType, std::size_t) { return true; },
+            [&o](LinkConstType n, size_type) {
+                o << *n << '\n';
+                return false;
+            });
         return o;
     }
 #endif
@@ -1196,8 +1143,3 @@ protected:
 /** @} */
 
 }  // namespace libkdtree
-
-
-
-
-

@@ -12,6 +12,8 @@
 #include <cmath>
 #include <utility>
 
+#include "function.hpp"
+
 namespace libkdtree
 {
 //! Intrusive binary tree links; \ref TreeNode "TreeNode" adds the stored value.
@@ -19,12 +21,13 @@ struct NodeBase {
     using BasePtr = NodeBase*;
     using BaseConstPtr = NodeBase const*;
 
-    BasePtr mParent;  //!< Parent node, or \c nullptr for header sentinel quirks in iterators.
-    BasePtr mLeft;    //!< Left child.
-    BasePtr mRight;   //!< Right child.
+    BasePtr mParent = nullptr;  //!< Parent node (the tree header for the root; \c nullptr for the header itself).
+    BasePtr mLeft = nullptr;    //!< Left child (header: leftmost node).
+    BasePtr mRight = nullptr;   //!< Right child (header: rightmost node).
 
-    NodeBase(BasePtr const parent_in = nullptr, BasePtr const left_in = nullptr,
-             BasePtr const right_in = nullptr) noexcept
+    constexpr NodeBase() noexcept = default;
+    constexpr NodeBase(BasePtr const parent_in, BasePtr const left_in = nullptr,
+                       BasePtr const right_in = nullptr) noexcept
         : mParent(parent_in), mLeft(left_in), mRight(right_in)
     {
     }
@@ -42,6 +45,19 @@ struct NodeBase {
         while (pNode->mRight) pNode = pNode->mRight;
         return pNode;
     }
+
+#ifdef KDTREE_DEFINE_OSTREAM_OPERATORS
+    template <typename Char, typename Traits>
+    friend std::basic_ostream<Char, Traits>& operator<<(
+        std::basic_ostream<Char, Traits>& out, NodeBase const& node)
+    {
+        out << &node;
+        out << " parent: " << node.mParent;
+        out << "; left: " << node.mLeft;
+        out << "; right: " << node.mRight;
+        return out;
+    }
+#endif
 };
 
 //! KD-tree node: \ref NodeBase links plus stored \ref mValue.
@@ -52,25 +68,14 @@ struct TreeNode : public NodeBase {
 
     Val mValue;  //!< User-visible element at this node.
 
-    TreeNode(Val const& val = Val(), BasePtr const parent_in = nullptr,
-             BasePtr const left_in = nullptr, BasePtr const right_in = nullptr)
-        : NodeBase(parent_in, left_in, right_in), mValue(val)
+    //! Constructs the stored value in place from \p args; links start null.
+    template <typename... Args>
+    explicit TreeNode(std::in_place_t, Args&&... args)
+        : NodeBase(), mValue(std::forward<Args>(args)...)
     {
     }
 
 #ifdef KDTREE_DEFINE_OSTREAM_OPERATORS
-
-    template <typename Char, typename Traits>
-    friend std::basic_ostream<Char, Traits>& operator<<(
-        std::basic_ostream<Char, Traits>& out, NodeBase const& node)
-    {
-        out << &node;
-        out << " parent: " << node.parent;
-        out << "; left: " << node.left;
-        out << "; right: " << node.right;
-        return out;
-    }
-
     template <typename Char, typename Traits>
     friend std::basic_ostream<Char, Traits>& operator<<(
         std::basic_ostream<Char, Traits>& out, TreeNode<Val> const& node)
@@ -82,7 +87,6 @@ struct TreeNode : public NodeBase {
         out << "; right: " << node.mRight;
         return out;
     }
-
 #endif
 };
 
@@ -96,15 +100,15 @@ public:
     {
     }
 
-    bool operator()(Val const& refA, Val const& refB) const
+    [[nodiscard]] bool operator()(Val const& refA, Val const& refB) const
     {
         return m_cmp(m_acc(refA, m_uDim), m_acc(refB, m_uDim));
     }
 
 private:
     std::size_t m_uDim;
-    Acc m_acc;
-    Cmp m_cmp;
+    KDTREE_NO_UNIQUE_ADDRESS Acc m_acc;
+    KDTREE_NO_UNIQUE_ADDRESS Cmp m_cmp;
 };
 
 //! \c true if `refAcc(refA,dim)` is ordered before `refAcc(refB,dim)` under \p refCmp.
@@ -153,14 +157,15 @@ template <typename Val, typename Cmp, typename Acc, typename NodeType>
  * \internal
  * \brief Single nearest-neighbor walk for a fixed tree layout.
  *
+ * Iterative (uses parent links, no recursion or allocation).
  * \param distSqMax Squared distance threshold (best-so-far); comparisons use squared metric internally.
  * \return Best node and pair `{level, sqrt(distSqMax)}` for the best found point.
  */
-template <class SearchVal, typename NodeType, typename Cmp, typename Acc, typename Dist,
-          typename Predicate>
+template <std::size_t uK, class SearchVal, typename NodeType, typename Cmp, typename Acc,
+          typename Dist, typename Predicate>
 [[nodiscard]] inline std::pair<const NodeType*,
                                std::pair<std::size_t, typename Dist::distance_type>>
-nodeNearest(std::size_t const uK, std::size_t uDim, SearchVal const& val,
+nodeNearest(std::size_t uDim, SearchVal const& val,
             const NodeType* pNode, const NodeBase* pEnd, const NodeType* pBest,
             typename Dist::distance_type distSqMax, Cmp const& refCmp, Acc const& refAcc,
             Dist const& refDist, Predicate fnPred)

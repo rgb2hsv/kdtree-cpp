@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <iterator>
 #include <memory>
 #include <type_traits>
@@ -18,41 +19,15 @@ namespace libkdtree
 template <std::size_t K, typename Val, typename Acc, typename Dist, typename Cmp, typename Alloc>
 class KDTree;
 
-template <typename Val, typename Ref, typename Ptr>
-class TreeIterator;
-
-template <typename Val, typename Ref, typename Ptr>
-bool operator==(TreeIterator<Val, Ref, Ptr> const&, TreeIterator<Val, Ref, Ptr> const&);
-
-template <typename Val>
-bool operator==(TreeIterator<Val, const Val&, const Val*> const&,
-                TreeIterator<Val, Val&, Val*> const&);
-
-template <typename Val>
-bool operator==(TreeIterator<Val, Val&, Val*> const&,
-                TreeIterator<Val, const Val&, const Val*> const&);
-
-template <typename Val, typename Ref, typename Ptr>
-bool operator!=(TreeIterator<Val, Ref, Ptr> const&, TreeIterator<Val, Ref, Ptr> const&);
-
-template <typename Val>
-bool operator!=(TreeIterator<Val, const Val&, const Val*> const&,
-                TreeIterator<Val, Val&, Val*> const&);
-
-template <typename Val>
-bool operator!=(TreeIterator<Val, Val&, Val*> const&,
-                TreeIterator<Val, const Val&, const Val*> const&);
-
 //! \internal In-order traversal using parent links; used by \ref TreeIterator.
 class BaseIterator
 {
 protected:
     using BaseConstPtr = NodeBase::BaseConstPtr;
-    BaseConstPtr mNode;
+    BaseConstPtr mNode = nullptr;
 
-    BaseIterator(BaseConstPtr pNode = nullptr) noexcept : mNode(pNode) {}
-    BaseIterator(BaseIterator const& refThat) noexcept = default;
-    BaseIterator& operator=(BaseIterator const&) noexcept = default;
+    constexpr BaseIterator() noexcept = default;
+    constexpr explicit BaseIterator(BaseConstPtr pNode) noexcept : mNode(pNode) {}
 
     void Increment() noexcept
     {
@@ -65,14 +40,14 @@ protected:
                 mNode = pParent;
                 pParent = mNode->mParent;
             }
-            if (pParent)
-                mNode = pParent;
+            if (pParent) mNode = pParent;
         }
     }
 
     void Decrement() noexcept
     {
         if (!mNode->mParent) {
+            // header (end()): step to the rightmost node
             mNode = mNode->mRight;
         } else if (mNode->mLeft) {
             BaseConstPtr pWalk = mNode->mLeft;
@@ -84,8 +59,7 @@ protected:
                 mNode = pParent;
                 pParent = mNode->mParent;
             }
-            if (pParent)
-                mNode = pParent;
+            if (pParent) mNode = pParent;
         }
     }
 
@@ -96,9 +70,9 @@ protected:
 /**
  * \brief Bidirectional iterator referencing a \ref TreeNode "TreeNode"'s \c value.
  *
- * \tparam Val Stored element type.
- * \tparam Ref Reference type returned by `operator*` (e.g. `Val const&` for const trees).
- * \tparam Ptr Pointer type returned by `operator->`.
+ * 	param Val Stored element type.
+ * 	param Ref Reference type returned by `operator*` (e.g. `Val const&` for const trees).
+ * 	param Ptr Pointer type returned by `operator->`.
  */
 template <typename Val, typename Ref, typename Ptr>
 class TreeIterator : protected BaseIterator
@@ -112,34 +86,30 @@ public:
     using Self = TreeIterator<Val, Ref, Ptr>;
     using LinkConstType = TreeNode<Val> const*;
     using iterator_category = std::bidirectional_iterator_tag;
+    using iterator_concept = std::bidirectional_iterator_tag;
     using difference_type = std::ptrdiff_t;
 
-    TreeIterator() = default;
-    explicit TreeIterator(LinkConstType pNode) noexcept : BaseIterator(pNode) {}
+    constexpr TreeIterator() noexcept = default;
+    constexpr explicit TreeIterator(LinkConstType pNode) noexcept : BaseIterator(pNode) {}
 
-    //! Convert mutable \ref iterator to \c const_iterator (omitted when \c Self is already \c iterator).
-    template<typename R2, typename P2,
-             typename = std::enable_if_t<
-                 std::is_same_v<TreeIterator<Val, R2, P2>, iterator> &&
-                 !std::is_same_v<TreeIterator<Val, Ref, Ptr>, iterator>>>
-    TreeIterator(TreeIterator<Val, R2, P2> const& that) noexcept : BaseIterator(that)
+    //! Converts a mutable \ref iterator to a \c const_iterator.
+    template <typename R2, typename P2>
+        requires(std::is_same_v<TreeIterator<Val, R2, P2>, iterator> &&
+                 !std::is_same_v<Self, iterator>)
+    constexpr TreeIterator(TreeIterator<Val, R2, P2> const& that) noexcept
+        : BaseIterator(that.node())
     {
     }
-
-    TreeIterator(TreeIterator const&) noexcept = default;
-    TreeIterator& operator=(TreeIterator const&) noexcept = default;
-    TreeIterator(TreeIterator&&) noexcept = default;
-    TreeIterator& operator=(TreeIterator&&) noexcept = default;
 
     //! Underlying tree node pointer (e.g. for \c KDTree::erase).
     [[nodiscard]] LinkConstType node() const noexcept
     {
-        return LinkConstType(mNode);
+        return static_cast<LinkConstType>(mNode);
     }
 
-    reference operator*() const { return LinkConstType(mNode)->mValue; }
+    [[nodiscard]] reference operator*() const noexcept { return node()->mValue; }
 
-    pointer operator->() const { return std::addressof(LinkConstType(mNode)->mValue); }
+    [[nodiscard]] pointer operator->() const noexcept { return std::addressof(node()->mValue); }
 
     Self& operator++() noexcept
     {
@@ -147,7 +117,7 @@ public:
         return *this;
     }
 
-    Self operator++(int) noexcept(std::is_nothrow_copy_constructible_v<Self>)
+    Self operator++(int) noexcept
     {
         Self ret = *this;
         Increment();
@@ -160,69 +130,21 @@ public:
         return *this;
     }
 
-    Self operator--(int) noexcept(std::is_nothrow_copy_constructible_v<Self>)
+    Self operator--(int) noexcept
     {
         Self ret = *this;
         Decrement();
         return ret;
     }
 
-    friend bool operator== <>(TreeIterator<Val, Ref, Ptr> const&, TreeIterator<Val, Ref, Ptr> const&);
-
-    friend bool operator== <>(TreeIterator<Val, const Val&, const Val*> const&,
-                               TreeIterator<Val, Val&, Val*> const&);
-
-    friend bool operator== <>(TreeIterator<Val, Val&, Val*> const&,
-                               TreeIterator<Val, const Val&, const Val*> const&);
-
-    friend bool operator!= <>(TreeIterator<Val, Ref, Ptr> const&, TreeIterator<Val, Ref, Ptr> const&);
-
-    friend bool operator!= <>(TreeIterator<Val, const Val&, const Val*> const&,
-                               TreeIterator<Val, Val&, Val*> const&);
-
-    friend bool operator!= <>(TreeIterator<Val, Val&, Val*> const&,
-                               TreeIterator<Val, const Val&, const Val*> const&);
+    //! Equality (C++20 synthesizes `!=`; mixed const/mutable compares via the converting constructor).
+    [[nodiscard]] friend bool operator==(Self const& refX, Self const& refY) noexcept
+    {
+        return refX.mNode == refY.mNode;
+    }
 };
 
-template <typename Val, typename Ref, typename Ptr>
-bool operator==(TreeIterator<Val, Ref, Ptr> const& refX, TreeIterator<Val, Ref, Ptr> const& refY)
-{
-    return refX.mNode == refY.mNode;
-}
-
-template <typename Val>
-bool operator==(TreeIterator<Val, const Val&, const Val*> const& refX,
-                TreeIterator<Val, Val&, Val*> const& refY)
-{
-    return refX.mNode == refY.mNode;
-}
-
-template <typename Val>
-bool operator==(TreeIterator<Val, Val&, Val*> const& refX,
-                TreeIterator<Val, const Val&, const Val*> const& refY)
-{
-    return refX.mNode == refY.mNode;
-}
-
-template <typename Val, typename Ref, typename Ptr>
-bool operator!=(TreeIterator<Val, Ref, Ptr> const& refX, TreeIterator<Val, Ref, Ptr> const& refY)
-{
-    return refX.mNode != refY.mNode;
-}
-
-template <typename Val>
-bool operator!=(TreeIterator<Val, const Val&, const Val*> const& refX,
-                TreeIterator<Val, Val&, Val*> const& refY)
-{
-    return refX.mNode != refY.mNode;
-}
-
-template <typename Val>
-bool operator!=(TreeIterator<Val, Val&, Val*> const& refX,
-                TreeIterator<Val, const Val&, const Val*> const& refY)
-{
-    return refX.mNode != refY.mNode;
-}
+static_assert(std::bidirectional_iterator<TreeIterator<int, int const&, int const*>>);
 
 }  // namespace libkdtree
 

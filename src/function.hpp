@@ -10,6 +10,13 @@
 
 #include <cstddef>
 
+//! Portable `[[no_unique_address]]` (MSVC only honours its vendor attribute).
+#if defined(_MSC_VER) && !defined(__clang__)
+#define KDTREE_NO_UNIQUE_ADDRESS [[msvc::no_unique_address]]
+#else
+#define KDTREE_NO_UNIQUE_ADDRESS [[no_unique_address]]
+#endif
+
 namespace libkdtree
 {
 
@@ -18,7 +25,8 @@ template <typename Val>
 struct BracketAccessor {
     using result_type = typename Val::value_type;
 
-    constexpr result_type operator()(Val const& refVal, std::size_t uIdx) const
+    [[nodiscard]] constexpr result_type operator()(Val const& refVal, std::size_t uIdx) const
+        noexcept(noexcept(refVal[uIdx]))
     {
         return refVal[uIdx];
     }
@@ -27,15 +35,17 @@ struct BracketAccessor {
 //! Predicate that accepts every \c Tp; used as default for unfiltered nearest-neighbor search.
 template <typename Tp>
 struct AlwaysTrue {
-    bool operator()(const Tp&) const { return true; }
+    [[nodiscard]] constexpr bool operator()(const Tp&) const noexcept { return true; }
 };
 
-//! Per-axis squared difference `(refA - refB)^2`; summed over dimensions for Euclidean-style distance.
+/**
+ * \brief Per-axis squared difference `(refA - refB)^2`; summed over dimensions for Euclidean-style distance.
+ */
 template <typename Tp, typename Dist>
 struct SquaredDifference {
     using distance_type = Dist;
 
-    constexpr distance_type operator()(Tp const& refA, Tp const& refB) const
+    [[nodiscard]] constexpr distance_type operator()(Tp const& refA, Tp const& refB) const
     {
         distance_type const distElem = refA - refB;
         return distElem * distElem;
@@ -47,22 +57,20 @@ template <typename Tp, typename Dist>
 struct SquaredDifferenceCounted {
     using distance_type = Dist;
 
-    SquaredDifferenceCounted() : m_cCalls(0) {}
-
-    void reset() { m_cCalls = 0; }
+    void reset() noexcept { m_cCalls = 0; }
 
     //! Reference to the number of invocations of `operator()`.
-    long& count() const { return m_cCalls; }
+    [[nodiscard]] long& count() const noexcept { return m_cCalls; }
 
     distance_type operator()(const Tp& refA, const Tp& refB) const
     {
-        distance_type distElem = refA - refB;
+        distance_type const distElem = refA - refB;
         ++m_cCalls;
         return distElem * distElem;
     }
 
 private:
-    mutable long m_cCalls;
+    mutable long m_cCalls = 0;
 };
 
 }  // namespace libkdtree
