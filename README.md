@@ -48,6 +48,30 @@ All traversals are iterative or depth-capped, so even a degenerate tree (e.g. bu
 
 Accessors on the tree: `valueAccessor`, `valueComparator`, `valueDistance`, `getAllocator`, `maxSize`.
 
+## BoxTree: closest point on geometry
+
+`boxtree.hpp` indexes geometric elements by their bounding boxes in 2D or 3D, for closest-point, signed-distance and ray queries. The API mirrors wedge's `ClosestPoint2D` / `ClosestPoint3D`.
+
+```cpp
+#include "boxtree.hpp"
+using namespace libkdtree;
+
+std::vector<Triangle<3>> tris = /* mesh faces, counter-clockwise = outward */;
+ClosestPoint3D<> tree(tris);                       // = BoxTree<Triangle<3>>
+
+Vec3 hit;
+const Triangle<3>* tri = nullptr;
+std::optional<double> d  = tree.closestPoint(Vec3{0, 0, 2}, hit, tri);
+std::optional<double> sd = tree.closestPointSignedDistance(Vec3{0, 0, 0.5});   // < 0 inside
+std::optional<double> r  = tree.intersectRayDistance(Vec3{0, 0, 0}, Vec3{1, 0, 0});
+std::size_t original     = tree.index(tri);        // insertion index of the hit
+```
+
+- **Primitives**: `Segment<N>`, `Triangle<N>` (filled in 2D), `Box<N>`, and `std::variant` of these (e.g. mixed 2D segments and triangles). Specialise `PrimitiveTraits<YourType>` (`dimension`, `bounds`, `closestPoint`, and optionally `normal` / `intersectRay`) to index your own types.
+- **Queries** (same names and `lastPoint` / `lastPrimitive` out-parameter overloads as wedge): `closestPoint`, `closestPointSqr` (optionally bounded by `maxDistance`, or collecting every primitive within it), `distance` / `distanceSqr` (optionally clamped to a threshold), `closestPointSignedDistance`, `closestPointOutside`, `intersectRayDistance`, `intersectSegmentDistance`. Signed-distance and ray overloads exist only when the primitive provides a normal / ray intersection. Lower-level forms are `nearest`, `within`, `visitWithin` and `raycast`.
+- **Building**: construct from a vector, or `append` / `emplace` and then `finish()`. `SplitMetric::Median` (the default) is best for closest-point queries; `SplitMetric::Weighted` (binned SAH) is best for rays.
+- **Differences from wedge**: coordinates are `double` (`std::array<double, N>`); queries on an empty tree return `nullopt` instead of throwing; `distanceSqr(pt, threshold)` returns `threshold²` on a miss.
+
 ## CMake
 
 **Standalone** (tests on by default; fetches GoogleTest):
@@ -75,7 +99,7 @@ The interface target exports include directories for the libkdtree source direct
 
 ## Tests
 
-Tests live in `tests/test.cpp`: API unit tests, plus stress tests over uniform, clustered, lattice/duplicate-heavy, high-dimensional and degenerate data (tens of thousands of points), cross-checking every query against brute force, plus allocator, move and exception-safety tests (GoogleTest). With `LIBKDTREE_BUILD_TESTS=ON`, the executable `libkdtree_tests` is registered with CTest (label `libkdtree`).
+Tests live in `tests/test.cpp`: API unit tests, plus stress tests over uniform, clustered, lattice/duplicate-heavy, high-dimensional and degenerate data (tens of thousands of points), cross-checking every query against brute force, plus allocator, move and exception-safety tests; and `BoxTree` tests (triangle soups, closed meshes, 2D polygons, mixed variants, custom primitives, degenerate scenes) checked against brute force (GoogleTest). With `LIBKDTREE_BUILD_TESTS=ON`, the executable `libkdtree_tests` is registered with CTest (label `libkdtree`).
 
 ## Optional compile-time defines
 
@@ -103,3 +127,5 @@ Original libkdtree++ is distributed under the **Artistic License 2.0**. See the 
 | `iterator.hpp` | `TreeIterator` |
 | `allocator.hpp` | `AllocBase`, node allocation via `std::allocator_traits` |
 | `function.hpp` | `BracketAccessor`, `SquaredDifference`, helpers |
+| `boxtree.hpp` | `BoxTree` / `ClosestPoint2D` / `ClosestPoint3D`, primitives and `PrimitiveTraits` |
+| `geometry.hpp` | `Vec`, `Box`, vector math, closest-point and ray-intersection routines |
