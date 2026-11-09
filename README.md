@@ -75,7 +75,7 @@ The interface target exports include directories for the libkdtree source direct
 
 ## Tests
 
-Unit tests live in `tests/test.cpp`; `tests/test_large.cpp` stress-tests uniform, clustered, lattice/duplicate-heavy, high-dimensional and degenerate data (tens of thousands of points), cross-checking every query against brute force, plus allocator, move and exception-safety tests (GoogleTest). With `LIBKDTREE_BUILD_TESTS=ON`, the executable `libkdtree_tests` is registered with CTest (label `libkdtree`).
+Tests live in `tests/test.cpp`: API unit tests, plus stress tests over uniform, clustered, lattice/duplicate-heavy, high-dimensional and degenerate data (tens of thousands of points), cross-checking every query against brute force, plus allocator, move and exception-safety tests (GoogleTest). With `LIBKDTREE_BUILD_TESTS=ON`, the executable `libkdtree_tests` is registered with CTest (label `libkdtree`).
 
 ## Optional compile-time defines
 

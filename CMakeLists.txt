@@ -37,8 +37,7 @@ if(LIBKDTREE_BUILD_TESTS)
     include(GoogleTest)
 
     add_executable(libkdtree_tests
-        tests/test.cpp
-        tests/test_large.cpp)
+        tests/test.cpp)
     target_link_libraries(libkdtree_tests PRIVATE
         libkdtree::libkdtree
         GTest::gtest
