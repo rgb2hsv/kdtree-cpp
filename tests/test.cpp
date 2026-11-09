@@ -7,12 +7,16 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <numbers>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include "boxtree.hpp"
 #include "kdtree.hpp"
 
 namespace
@@ -1121,4 +1125,497 @@ TEST(KDTreeLarge, EmplaceAndMoveInsert)
     Throwy::copiesBeforeThrow = -1;
     EXPECT_EQ(t.size(), 2000u);
     EXPECT_TRUE(t.checkTreeInvariants());
+}
+
+// ===========================================================================
+// BoxTree: closest-point / signed-distance / ray queries over primitives.
+// Every query is cross-checked against a brute-force scan.
+// ===========================================================================
+
+namespace
+{
+using libkdtree::Box;
+using libkdtree::BoxTree;
+using libkdtree::Segment;
+using libkdtree::SplitMetric;
+using libkdtree::Triangle;
+using libkdtree::Vec2;
+using libkdtree::Vec3;
+namespace geom = libkdtree::geom;
+
+//! Filled disk: a user-defined primitive (traits specialised below).
+struct Disk {
+    Vec2 c;
+    double r;
+};
+}  // namespace
+
+template <>
+struct libkdtree::PrimitiveTraits<Disk> {
+    static constexpr std::size_t dimension = 2;
+    static Box<2> bounds(Disk const& d) noexcept
+    {
+        return Box<2>{{d.c[0] - d.r, d.c[1] - d.r}, {d.c[0] + d.r, d.c[1] + d.r}};
+    }
+    static Vec2 closestPoint(Disk const& d, Vec2 const& q) noexcept
+    {
+        Vec2 const v = geom::sub(q, d.c);
+        double const len = geom::length(v);
+        return len <= d.r ? q : geom::madd(d.c, v, d.r / len);
+    }
+};
+
+namespace
+{
+template <class Prim>
+using TraitsOf = libkdtree::PrimitiveTraits<Prim>;
+
+//! Brute-force nearest: {distanceSqr, insertion index} (index -1 when none qualifies).
+template <class Prim, class Accept>
+std::pair<double, long> bruteNearest(std::vector<Prim> const& prims,
+                                     libkdtree::Vec<TraitsOf<Prim>::dimension> const& q,
+                                     double maxDistance, Accept accept)
+{
+    double best = maxDistance * maxDistance;
+    long idx = -1;
+    for (std::size_t i = 0; i < prims.size(); ++i) {
+        auto const cp = TraitsOf<Prim>::closestPoint(prims[i], q);
+        double const d2 = geom::distanceSqr(cp, q);
+        if ((d2 < best || (idx < 0 && d2 <= best)) && accept(cp)) {
+            best = d2;
+            idx = static_cast<long>(i);
+        }
+    }
+    return {best, idx};
+}
+
+template <class Prim>
+std::pair<double, long> bruteNearest(std::vector<Prim> const& prims,
+                                     libkdtree::Vec<TraitsOf<Prim>::dimension> const& q,
+                                     double maxDistance = std::numeric_limits<double>::infinity())
+{
+    return bruteNearest(prims, q, maxDistance, [](auto const&) { return true; });
+}
+
+//! Brute-force first ray hit: smallest t in [0, tMax], or nullopt.
+template <class Prim>
+std::optional<double> bruteRay(std::vector<Prim> const& prims,
+                               libkdtree::Vec<TraitsOf<Prim>::dimension> const& o,
+                               libkdtree::Vec<TraitsOf<Prim>::dimension> const& d, double tMax)
+{
+    std::optional<double> best;
+    for (auto const& p : prims) {
+        auto const t = TraitsOf<Prim>::intersectRay(p, o, d);
+        if (t && *t >= 0 && *t <= tMax && (!best || *t < *best)) best = t;
+    }
+    return best;
+}
+
+std::vector<Triangle<3>> randomTriangles(std::size_t n, double range, double maxSize, unsigned seed)
+{
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> c(-range, range);
+    std::uniform_real_distribution<double> s(0.05, maxSize);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    std::vector<Triangle<3>> tris(n);
+    for (auto& t : tris) {
+        Vec3 const ctr{c(rng), c(rng), c(rng)};
+        double const sz = s(rng);
+        auto vtx = [&] { return Vec3{ctr[0] + sz * u(rng), ctr[1] + sz * u(rng), ctr[2] + sz * u(rng)}; };
+        t = {vtx(), vtx(), vtx()};
+    }
+    return tris;
+}
+
+//! Closed lat-long sphere with outward-facing (counter-clockwise) triangles.
+std::vector<Triangle<3>> sphereMesh(double radius, int nLat, int nLon)
+{
+    auto vtx = [&](int i, int j) {
+        double const th = std::numbers::pi * i / nLat;
+        double const ph = 2 * std::numbers::pi * j / nLon;
+        return Vec3{radius * std::sin(th) * std::cos(ph), radius * std::sin(th) * std::sin(ph),
+                    radius * std::cos(th)};
+    };
+    std::vector<Triangle<3>> tris;
+    auto add = [&](Vec3 a, Vec3 b, Vec3 c) {
+        Vec3 const n = geom::cross(geom::sub(b, a), geom::sub(c, a));
+        if (geom::lengthSqr(n) == 0) return;  // pole slivers
+        Vec3 const ctr = geom::mul(geom::add(geom::add(a, b), c), 1.0 / 3);
+        if (geom::dot(n, ctr) < 0) std::swap(b, c);
+        tris.push_back({a, b, c});
+    };
+    for (int i = 0; i < nLat; ++i)
+        for (int j = 0; j < nLon; ++j) {
+            add(vtx(i, j), vtx(i + 1, j), vtx(i + 1, j + 1));
+            add(vtx(i, j), vtx(i + 1, j + 1), vtx(i, j + 1));
+        }
+    return tris;
+}
+
+Vec3 randomDirection(std::mt19937& rng)
+{
+    std::normal_distribution<double> g;
+    Vec3 v;
+    do v = {g(rng), g(rng), g(rng)};
+    while (geom::lengthSqr(v) < 1e-12);
+    return geom::normalize(v);
+}
+
+//! Cross-checks every closest-point flavour plus rays for a 3D triangle tree.
+void crossCheckTriangles(BoxTree<Triangle<3>> const& tree, std::vector<Triangle<3>> const& tris,
+                         int queries, double range, unsigned seed)
+{
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> u(-range * 1.2, range * 1.2);
+    for (int qi = 0; qi < queries; ++qi) {
+        Vec3 const q{u(rng), u(rng), u(rng)};
+
+        // unbounded
+        auto const [bestSq, bestIdx] = bruteNearest(tris, q);
+        Vec3 lastPoint{};
+        Triangle<3> const* lastTri = nullptr;
+        auto const d2 = tree.closestPointSqr(q, lastPoint, lastTri);
+        ASSERT_TRUE(d2.has_value());
+        ASSERT_EQ(*d2, bestSq) << "query " << qi;
+        ASSERT_NE(lastTri, nullptr);
+        ASSERT_EQ(geom::distanceSqr(lastPoint, q), bestSq);
+        // the reported primitive really is at that distance
+        ASSERT_EQ(geom::distanceSqr(TraitsOf<Triangle<3>>::closestPoint(*lastTri, q), q), bestSq);
+        ASSERT_EQ(&tree.primitive(tree.index(lastTri)), lastTri);
+        ASSERT_DOUBLE_EQ(*tree.closestPoint(q), std::sqrt(bestSq));
+        ASSERT_EQ(tree.distanceSqr(q), bestSq);
+
+        // bounded: just above and just below the true distance
+        double const r = std::sqrt(bestSq);
+        ASSERT_EQ(tree.closestPointSqr(q, r * 1.001 + 1e-12).value(), bestSq);
+        if (bestSq > 0) {
+            Triangle<3> const* miss = lastTri;
+            Vec3 untouched{7, 7, 7};
+            ASSERT_FALSE(tree.closestPoint(q, r * 0.999, untouched, miss).has_value());
+            ASSERT_EQ(miss, nullptr);
+            ASSERT_EQ(untouched, (Vec3{7, 7, 7}));
+            ASSERT_EQ(tree.distance(q, r * 0.999), r * 0.999);
+        }
+
+        // all within a radius
+        double const radius = r + 3.0;
+        std::vector<Triangle<3> const*> found;
+        Vec3 nearestPt{};
+        ASSERT_EQ(tree.closestPointSqr(q, radius, nearestPt, found).value(), bestSq);
+        std::vector<std::size_t> got, expected;
+        for (auto const* t : found) got.push_back(tree.index(t));
+        for (std::size_t i = 0; i < tris.size(); ++i)
+            if (geom::distanceSqr(TraitsOf<Triangle<3>>::closestPoint(tris[i], q), q) <= radius * radius)
+                expected.push_back(i);
+        std::sort(got.begin(), got.end());
+        ASSERT_EQ(got, expected) << "within query " << qi;
+
+        // half-space restricted
+        Vec3 const v = randomDirection(rng);
+        auto const [outSq, outIdx] = bruteNearest(tris, q, std::numeric_limits<double>::infinity(),
+                                                  [&](Vec3 const& cp) { return geom::dot(geom::sub(cp, q), v) >= 0; });
+        auto const out = tree.closestPointOutside(q, v);
+        ASSERT_EQ(out.has_value(), outIdx >= 0);
+        if (out) ASSERT_DOUBLE_EQ(*out, std::sqrt(outSq));
+
+        // ray and segment
+        auto const rayT = bruteRay(tris, q, v, std::numeric_limits<double>::infinity());
+        Triangle<3> const* hitTri = nullptr;
+        Vec3 hitPt{};
+        auto const rayD = tree.intersectRayDistance(q, v, hitPt, hitTri);
+        ASSERT_EQ(rayD.has_value(), rayT.has_value()) << "ray " << qi;
+        if (rayD) {
+            ASSERT_EQ(*rayD, *rayT * geom::length(v));
+            ASSERT_EQ(TraitsOf<Triangle<3>>::intersectRay(*hitTri, q, v), rayT);
+        }
+        Vec3 const p2 = geom::madd(q, v, range * 0.5);
+        auto const segT = bruteRay(tris, q, geom::sub(p2, q), 1.0);
+        auto const segD = tree.intersectSegmentDistance(q, p2);
+        ASSERT_EQ(segD.has_value(), segT.has_value()) << "segment " << qi;
+        if (segD) ASSERT_DOUBLE_EQ(*segD, *segT * geom::length(geom::sub(p2, q)));
+    }
+}
+}  // namespace
+
+TEST(BoxTreeGeometry, ClosestPointOnTriangleRegions)
+{
+    Vec3 const a{0, 0, 0}, b{2, 0, 0}, c{0, 2, 0};
+    auto cp = [&](Vec3 p) { return geom::closestPointOnTriangle(a, b, c, p); };
+    EXPECT_EQ(cp({0.5, 0.5, 3}), (Vec3{0.5, 0.5, 0}));  // face
+    EXPECT_EQ(cp({-1, -1, 1}), a);                      // vertex regions
+    EXPECT_EQ(cp({5, -1, 0}), b);
+    EXPECT_EQ(cp({-1, 5, 0}), c);
+    EXPECT_EQ(cp({1, -3, 0}), (Vec3{1, 0, 0}));  // edge ab
+    EXPECT_EQ(cp({-3, 1, 0}), (Vec3{0, 1, 0}));  // edge ac
+    auto const bc = cp({2, 2, 0});               // edge bc
+    EXPECT_NEAR(bc[0], 1, 1e-12);
+    EXPECT_NEAR(bc[1], 1, 1e-12);
+    // degenerate (collinear) triangle falls back to its edges
+    auto const dg = geom::closestPointOnTriangle(Vec3{0, 0, 0}, Vec3{1, 0, 0}, Vec3{2, 0, 0}, Vec3{1.5, 1, 0});
+    EXPECT_EQ(dg, (Vec3{1.5, 0, 0}));
+}
+
+TEST(BoxTreeGeometry, FilledTriangle2DAndRays)
+{
+    Triangle<2> const t{{0, 0}, {4, 0}, {0, 4}};
+    using T = TraitsOf<Triangle<2>>;
+    EXPECT_EQ(T::closestPoint(t, {1, 1}), (Vec2{1, 1}));  // inside: exact
+    EXPECT_EQ(T::closestPoint(t, {2, -2}), (Vec2{2, 0}));
+    EXPECT_EQ(T::intersectRay(t, {1, 1}, {1, 0}), 0.0);  // starts inside
+    EXPECT_EQ(T::intersectRay(t, {-2, 1}, {1, 0}), 2.0);
+    EXPECT_FALSE(T::intersectRay(t, {-2, 1}, {-1, 0}).has_value());
+
+    EXPECT_EQ(geom::intersectRaySegment({0, -1}, {0, 1}, {-3, 0}, {1, 0}), 3.0);
+    EXPECT_FALSE(geom::intersectRaySegment({0, -1}, {0, 1}, {-3, 0}, {0, 1}).has_value());  // parallel
+    EXPECT_EQ(geom::intersectRayTriangle({0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0.2, 0.2, 5}, {0, 0, -1}), 5.0);
+    EXPECT_FALSE(geom::intersectRayTriangle({0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {2, 2, 5}, {0, 0, -1}).has_value());
+
+    Box<3> const box{{0, 0, 0}, {1, 1, 1}};
+    // zero direction components must not produce NaN misses
+    auto const h = box.intersectRay({0.5, 0.5, -2}, {0, 0, 1}, 0.0, 100.0);
+    ASSERT_TRUE(h.has_value());
+    EXPECT_EQ(h->first, 2.0);
+    EXPECT_EQ(h->second, 3.0);
+    EXPECT_FALSE(box.intersectRay({1.5, 0.5, -2}, {0, 0, 1}, 0.0, 100.0).has_value());
+    EXPECT_EQ(box.distanceSqr({2, 0.5, 3}), 5.0);
+}
+
+TEST(BoxTree, EmptyTree)
+{
+    libkdtree::ClosestPoint3D<> tree;
+    EXPECT_TRUE(tree.empty());
+    EXPECT_FALSE(tree.closestPoint(Vec3{0, 0, 0}).has_value());
+    EXPECT_FALSE(tree.closestPointSignedDistance(Vec3{0, 0, 0}).has_value());
+    EXPECT_FALSE(tree.intersectRayDistance(Vec3{0, 0, 0}, Vec3{1, 0, 0}).has_value());
+    EXPECT_EQ(tree.distance(Vec3{0, 0, 0}), std::numeric_limits<double>::infinity());
+    EXPECT_EQ(tree.distance(Vec3{0, 0, 0}, 2.5), 2.5);
+    EXPECT_EQ(tree.distanceSqr(Vec3{0, 0, 0}, 2.5), 6.25);
+    EXPECT_TRUE(tree.within(Vec3{0, 0, 0}, 10).empty());
+}
+
+TEST(BoxTree, TriangleSoupMedianMatchesBruteForce)
+{
+    auto const tris = randomTriangles(6000, 100.0, 6.0, 31);
+    BoxTree<Triangle<3>> tree(tris);  // Median by default
+    EXPECT_EQ(tree.size(), tris.size());
+    EXPECT_LE(tree.depth(), 13u);  // ceil(log2(6000 / 4)) + 1
+    crossCheckTriangles(tree, tris, 250, 100.0, 32);
+}
+
+TEST(BoxTree, TriangleSoupWeightedMatchesBruteForce)
+{
+    auto const tris = randomTriangles(6000, 100.0, 6.0, 33);
+    libkdtree::ClosestPoint3D<> tree(tris, 64, SplitMetric::Weighted);
+    EXPECT_EQ(tree.getSplitMetric(), SplitMetric::Weighted);
+    crossCheckTriangles(tree, tris, 250, 100.0, 34);
+}
+
+TEST(BoxTree, LargeMixedScaleScene)
+{
+    // a few huge triangles over many tiny ones: stresses overlap-heavy boxes
+    auto tris = randomTriangles(40000, 50.0, 0.5, 35);
+    auto big = randomTriangles(40, 50.0, 60.0, 36);
+    tris.insert(tris.end(), big.begin(), big.end());
+    for (auto metric : {SplitMetric::Median, SplitMetric::Weighted}) {
+        BoxTree<Triangle<3>> tree(tris, 64, metric);
+        EXPECT_LE(tree.depth(), BoxTree<Triangle<3>>::kMaxDepthLimit);
+        crossCheckTriangles(tree, tris, 60, 50.0, 37);
+    }
+}
+
+TEST(BoxTree, SphereSignedDistance)
+{
+    auto const tris = sphereMesh(1.0, 24, 48);
+    libkdtree::ClosestPoint3D<> tree(tris);
+    std::mt19937 rng(38);
+    std::uniform_real_distribution<double> inside(0.0, 0.85), outside(1.15, 4.0);
+    for (int i = 0; i < 400; ++i) {
+        Vec3 const dir = randomDirection(rng);
+        Vec3 const pin = geom::mul(dir, inside(rng));
+        Vec3 const pout = geom::mul(dir, outside(rng));
+        Vec3 cp{};
+        Triangle<3> const* tri = nullptr;
+        auto const sin = tree.closestPointSignedDistance(pin, cp, tri);
+        ASSERT_TRUE(sin.has_value());
+        EXPECT_LT(*sin, 0) << i;
+        EXPECT_DOUBLE_EQ(-*sin, std::sqrt(bruteNearest(tris, pin).first));
+        auto const sout = tree.closestPointSignedDistance(pout);
+        ASSERT_TRUE(sout.has_value());
+        EXPECT_GT(*sout, 0) << i;
+        // every ray from inside leaves through the surface at roughly radius 1
+        auto const hit = tree.intersectRayDistance(pin, dir);
+        ASSERT_TRUE(hit.has_value());
+        EXPECT_NEAR(geom::length(pin) + *hit, 1.0, 0.02);
+    }
+    // bounded signed query misses beyond the bound
+    EXPECT_FALSE(tree.closestPointSignedDistance(Vec3{0, 0, 3}, 1.5).has_value());
+    EXPECT_NEAR(*tree.closestPointSignedDistance(Vec3{0, 0, 3}, 2.5), 2.0, 1e-9);
+}
+
+TEST(BoxTree, Polygon2DSignedDistance)
+{
+    // counter-clockwise circle: Segment<2> normals point outward
+    std::vector<Segment<2>> segs;
+    int const n = 720;
+    for (int i = 0; i < n; ++i) {
+        double const a0 = 2 * std::numbers::pi * i / n, a1 = 2 * std::numbers::pi * (i + 1) / n;
+        segs.push_back({{5 * std::cos(a0), 5 * std::sin(a0)}, {5 * std::cos(a1), 5 * std::sin(a1)}});
+    }
+    libkdtree::ClosestPoint2D<> tree(segs);
+    std::mt19937 rng(39);
+    std::uniform_real_distribution<double> ang(0, 2 * std::numbers::pi), rad(0, 10);
+    for (int i = 0; i < 2000; ++i) {
+        double const a = ang(rng), r = rad(rng);
+        Vec2 const p{r * std::cos(a), r * std::sin(a)};
+        auto const [bestSq, idx] = bruteNearest(segs, p);
+        auto const sd = tree.closestPointSignedDistance(p);
+        ASSERT_TRUE(sd.has_value());
+        EXPECT_DOUBLE_EQ(std::abs(*sd), std::sqrt(bestSq));
+        if (std::abs(r - 5) > 0.01) EXPECT_EQ(*sd < 0, r < 5) << "r=" << r;
+        // rays from the origin always hit the circle at distance ~5
+        EXPECT_NEAR(*tree.intersectRayDistance(Vec2{0, 0}, Vec2{std::cos(a), std::sin(a)}), 5.0, 1e-3);
+    }
+}
+
+TEST(BoxTree, Mixed2DVariantMatchesBruteForce)
+{
+    using Prim = std::variant<Segment<2>, Triangle<2>>;
+    static_assert(!BoxTree<Prim>::kHasNormal, "filled triangles have no normal");
+    static_assert(BoxTree<Prim>::kHasRay);
+    std::mt19937 rng(40);
+    std::uniform_real_distribution<double> c(-200, 200), s(-3, 3);
+    std::vector<Prim> prims;
+    for (int i = 0; i < 8000; ++i) {
+        Vec2 const p{c(rng), c(rng)};
+        auto off = [&] { return Vec2{p[0] + s(rng), p[1] + s(rng)}; };
+        if (i % 3 == 0)
+            prims.emplace_back(Triangle<2>{p, off(), off()});
+        else
+            prims.emplace_back(Segment<2>{p, off()});
+    }
+    for (auto metric : {SplitMetric::Median, SplitMetric::Weighted}) {
+        BoxTree<Prim> tree(prims, 64, metric);
+        std::mt19937 q(41);
+        std::uniform_real_distribution<double> u(-220, 220);
+        std::uniform_real_distribution<double> ang(0, 2 * std::numbers::pi);
+        for (int i = 0; i < 300; ++i) {
+            Vec2 const p{u(q), u(q)};
+            auto const [bestSq, idx] = bruteNearest(prims, p);
+            Prim const* hit = nullptr;
+            auto const d = tree.closestPoint(p, hit);
+            ASSERT_TRUE(d.has_value());
+            ASSERT_DOUBLE_EQ(*d, std::sqrt(bestSq));
+            ASSERT_EQ(tree.within(p, std::sqrt(bestSq) + 2).size(),
+                      static_cast<std::size_t>(std::count_if(prims.begin(), prims.end(), [&](Prim const& pr) {
+                          return geom::distanceSqr(TraitsOf<Prim>::closestPoint(pr, p), p) <=
+                                 std::pow(std::sqrt(bestSq) + 2, 2);
+                      })));
+            double const a = ang(q);
+            Vec2 const dir{std::cos(a), std::sin(a)};
+            auto const t = bruteRay(prims, p, dir, std::numeric_limits<double>::infinity());
+            auto const rd = tree.intersectRayDistance(p, dir);
+            ASSERT_EQ(rd.has_value(), t.has_value());
+            if (rd) ASSERT_DOUBLE_EQ(*rd, *t);
+        }
+        // a point inside a filled triangle is at distance 0
+        auto const& tri = std::get<Triangle<2>>(prims[0]);
+        Vec2 const centroid = geom::mul(geom::add(geom::add(tri.a, tri.b), tri.c), 1.0 / 3);
+        EXPECT_EQ(tree.distance(centroid), 0.0);
+    }
+}
+
+TEST(BoxTree, CustomPrimitiveViaTraits)
+{
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<double> c(-100, 100), r(0.1, 4);
+    std::vector<Disk> disks(5000);
+    for (auto& d : disks) d = {{c(rng), c(rng)}, r(rng)};
+    BoxTree<Disk> tree(disks);
+    static_assert(!BoxTree<Disk>::kHasRay && !BoxTree<Disk>::kHasNormal);
+    for (int i = 0; i < 500; ++i) {
+        Vec2 const p{c(rng) * 1.2, c(rng) * 1.2};
+        Vec2 cp{};
+        Disk const* hit = nullptr;
+        auto const d2 = tree.closestPointSqr(p, cp, hit);
+        ASSERT_EQ(*d2, bruteNearest(disks, p).first);
+        if (*d2 == 0) {
+            EXPECT_LE(geom::distanceSqr(p, hit->c), hit->r * hit->r);
+        }
+    }
+}
+
+TEST(BoxTree, BoxPrimitivesRays)
+{
+    std::mt19937 rng(43);
+    std::uniform_real_distribution<double> c(-50, 50), e(0.1, 3);
+    std::vector<Box<3>> boxes(3000);
+    for (auto& b : boxes) {
+        Vec3 const p{c(rng), c(rng), c(rng)};
+        b = Box<3>::fromPoints(p, {p[0] + e(rng), p[1] + e(rng), p[2] + e(rng)});
+    }
+    BoxTree<Box<3>> tree(boxes, 64, SplitMetric::Weighted);
+    for (int i = 0; i < 400; ++i) {
+        Vec3 const o{c(rng), c(rng), c(rng)};
+        Vec3 const d = randomDirection(rng);
+        auto const t = bruteRay(boxes, o, d, std::numeric_limits<double>::infinity());
+        auto const rd = tree.intersectRayDistance(o, d);
+        ASSERT_EQ(rd.has_value(), t.has_value());
+        if (rd) ASSERT_EQ(*rd, *t * geom::length(d));
+        ASSERT_EQ(tree.distanceSqr(o), bruteNearest(boxes, o).first);
+    }
+}
+
+TEST(BoxTree, DegenerateInputs)
+{
+    // identical primitives: every centroid coincides, so the root stays one big leaf
+    std::vector<Triangle<3>> same(300, Triangle<3>{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}});
+    BoxTree<Triangle<3>> t1(same);
+    EXPECT_EQ(t1.nodeCount(), 1u);
+    EXPECT_DOUBLE_EQ(*t1.closestPoint(Vec3{0.2, 0.2, 2}), 2.0);
+    EXPECT_EQ(t1.within(Vec3{0.2, 0.2, 2}, 2.0).size(), 300u);
+
+    // perfectly flat scene (z = 0) with SAH
+    auto flat = randomTriangles(3000, 40.0, 2.0, 44);
+    for (auto& t : flat) t.a[2] = t.b[2] = t.c[2] = 0;
+    BoxTree<Triangle<3>> t2(flat, 64, SplitMetric::Weighted);
+    crossCheckTriangles(t2, flat, 80, 40.0, 45);
+
+    // depth cap forces large leaves; queries stay exact
+    auto const tris = randomTriangles(2000, 40.0, 2.0, 46);
+    BoxTree<Triangle<3>> t3(tris, 3);
+    EXPECT_EQ(t3.depth(), 3u);
+    EXPECT_EQ(t3.nodeCount(), 7u);
+    crossCheckTriangles(t3, tris, 50, 40.0, 47);
+
+    // a single primitive
+    BoxTree<Segment<3>> t4(std::vector<Segment<3>>{{{0, 0, 0}, {0, 0, 10}}});
+    EXPECT_DOUBLE_EQ(*t4.closestPoint(Vec3{3, 4, 5}), 5.0);
+    EXPECT_FALSE(BoxTree<Segment<3>>::kHasRay);  // 3D segments have no ray support
+}
+
+TEST(BoxTree, AppendFinishAndIndices)
+{
+    auto const tris = randomTriangles(1500, 30.0, 3.0, 48);
+    BoxTree<Triangle<3>> tree(SplitMetric::Median);
+    for (std::size_t i = 0; i < 1000; ++i) tree.append(tris[i]);
+    EXPECT_THROW((void)tree.closestPoint(Vec3{0, 0, 0}), std::logic_error);
+    tree.finish();
+    for (std::size_t i = 1000; i < tris.size(); ++i) tree.emplace(tris[i]);
+    tree.finish();
+    ASSERT_EQ(tree.size(), tris.size());
+
+    // insertion indices survive the reordering of both builds
+    for (std::size_t i = 0; i < tris.size(); ++i) {
+        auto const& p = tree.primitive(i);
+        EXPECT_EQ(p.a, tris[i].a);
+        EXPECT_EQ(tree.index(&p), i);
+    }
+    crossCheckTriangles(tree, tris, 80, 30.0, 49);
+
+    // rebuild with a different metric, then reset
+    tree.build(std::vector<Triangle<3>>(tris.begin(), tris.begin() + 10), SplitMetric::Weighted);
+    EXPECT_EQ(tree.size(), 10u);
+    tree.reset();
+    EXPECT_TRUE(tree.empty());
+    EXPECT_FALSE(tree.closestPoint(Vec3{0, 0, 0}).has_value());
 }
