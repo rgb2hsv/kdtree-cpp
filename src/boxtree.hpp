@@ -417,7 +417,8 @@ public:
     {
         checkBuilt();
         if (mNodes.empty()) return std::nullopt;
-        auto const rootHit = mNodes[0].bounds.intersectRay(org, dir, 0.0, tMax);
+        Ray<N> const ray = Ray<N>::make(org, dir);  // reciprocal direction computed once
+        auto const rootHit = mNodes[0].bounds.intersect(ray, 0.0, tMax);
         if (!rootHit) return std::nullopt;
 
         std::optional<RayHit> best;
@@ -438,8 +439,8 @@ public:
                     }
                 }
             } else {
-                auto const hl = mNodes[n.first].bounds.intersectRay(org, dir, 0.0, bestT);
-                auto const hr = mNodes[n.first + 1].bounds.intersectRay(org, dir, 0.0, bestT);
+                auto const hl = mNodes[n.first].bounds.intersect(ray, 0.0, bestT);
+                auto const hr = mNodes[n.first + 1].bounds.intersect(ray, 0.0, bestT);
                 pushOrdered(stack, top, n.first, hl ? std::optional(hl->first) : std::nullopt,
                             n.first + 1, hr ? std::optional(hr->first) : std::nullopt);
             }
