@@ -6,8 +6,11 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <utility>
+
+#include "function.hpp"
 
 namespace libkdtree
 {
@@ -34,7 +37,7 @@ struct KdTreeRegion {
     using CenterPair = std::pair<KdTreeRegion, SubVal>;
 
     //! Unbounded initialization: accessor and comparator only; bounds must be set before use.
-    KdTreeRegion(Acc const& acc = Acc(), Cmp const& cmp = Cmp()) : mAccessor(acc), mComparator(cmp) {}
+    explicit KdTreeRegion(Acc const& acc = Acc(), Cmp const& cmp = Cmp()) : mAccessor(acc), mComparator(cmp) {}
 
     //! Degenerate box: point \p v0 (low and high equal on every axis).
     template <typename V>
@@ -52,16 +55,17 @@ struct KdTreeRegion {
         : mAccessor(acc), mComparator(cmp)
     {
         for (std::size_t i = 0; i != K; ++i) {
-            mSubLow[i] = mAccessor(v0, i) - r;
-            mSubHigh[i] = mAccessor(v0, i) + r;
+            subvalue_type const c = mAccessor(v0, i);
+            mSubLow[i] = c - r;
+            mSubHigh[i] = c + r;
         }
     }
 
-    //! Intersection test with a box expanded by \p that.second on all sides around \p that.first.
+    //! Intersection test against \p that.first after growing this box by \p that.second on every side.
     [[nodiscard]] bool intersectsWith(CenterPair const& that) const
     {
         for (std::size_t i = 0; i != K; ++i) {
-            if (mComparator(that.first.mSubLow[i], mSubLow[i] - that.second) ||
+            if (mComparator(that.first.mSubHigh[i], mSubLow[i] - that.second) ||
                 mComparator(mSubHigh[i] + that.second, that.first.mSubLow[i]))
                 return false;
         }
@@ -82,8 +86,8 @@ struct KdTreeRegion {
     [[nodiscard]] bool encloses(value_type const& v) const
     {
         for (std::size_t i = 0; i != K; ++i) {
-            if (mComparator(mAccessor(v, i), mSubLow[i]) || mComparator(mSubHigh[i], mAccessor(v, i)))
-                return false;
+            auto const c = mAccessor(v, i);
+            if (mComparator(c, mSubLow[i]) || mComparator(mSubHigh[i], c)) return false;
         }
         return true;
     }
@@ -102,9 +106,9 @@ struct KdTreeRegion {
         return *this;
     }
 
-    subvalue_type mSubLow[K], mSubHigh[K];  //!< Inclusive per-axis interval `[mSubLow[i], mSubHigh[i]]`.
-    Acc mAccessor;                           //!< Coordinate accessor (copied into region queries).
-    Cmp mComparator;                         //!< Scalar comparator.
+    std::array<subvalue_type, K> mSubLow{}, mSubHigh{};  //!< Inclusive per-axis interval `[mSubLow[i], mSubHigh[i]]`.
+    KDTREE_NO_UNIQUE_ADDRESS Acc mAccessor;               //!< Coordinate accessor.
+    KDTREE_NO_UNIQUE_ADDRESS Cmp mComparator;             //!< Scalar comparator.
 };
 
 }  // namespace libkdtree

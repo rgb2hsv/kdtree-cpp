@@ -7,71 +7,57 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
+#include <utility>
 
 #include "node.hpp"
 
 namespace libkdtree
 {
 
-//! CRTP-style base: allocate / construct / destroy \ref TreeNode "TreeNode<Tp>" with \p Alloc.
+/**
+ * \brief Allocates / constructs / destroys \ref TreeNode "TreeNode<Tp>" via \c std::allocator_traits.
+ *
+ * \p Alloc may be an allocator for either \c Tp or \c TreeNode<Tp>; it is rebound to the node type.
+ */
 template <typename Tp, typename Alloc>
 class AllocBase
 {
 public:
     using NodeType = TreeNode<Tp>;
     using BasePtr = typename NodeType::BasePtr;
-    using allocator_type = Alloc;
+    using allocator_type =
+        typename std::allocator_traits<Alloc>::template rebind_alloc<NodeType>;
+    using AllocTraits = std::allocator_traits<allocator_type>;
 
-    explicit AllocBase(allocator_type const& refAlloc) : mNodeAlloc(refAlloc) {}
+    explicit AllocBase(allocator_type const& refAlloc) noexcept : mNodeAlloc(refAlloc) {}
+    explicit AllocBase(allocator_type&& refAlloc) noexcept : mNodeAlloc(std::move(refAlloc)) {}
 
-    [[nodiscard]] allocator_type getAllocator() const { return mNodeAlloc; }
-
-    /**
-     * \brief Allocates one node; deallocates in the destructor unless \ref disconnect().
-     *
-     * Typical use: `NoLeakAlloc guard(this); constructNode(guard.get(), ...); guard.disconnect();`
-     */
-    class NoLeakAlloc
-    {
-        AllocBase* mBase;
-        NodeType* mNewNode;
-
-    public:
-        explicit NoLeakAlloc(AllocBase* base_in)
-            : mBase(base_in), mNewNode(mBase->allocateNode())
-        {
-        }
-
-        NoLeakAlloc(NoLeakAlloc const&) = delete;
-        NoLeakAlloc& operator=(NoLeakAlloc const&) = delete;
-        NoLeakAlloc(NoLeakAlloc&&) = delete;
-        NoLeakAlloc& operator=(NoLeakAlloc&&) = delete;
-
-        //! Pointer to uninitialized storage (placement-new in \ref constructNode).
-        NodeType* get() { return mNewNode; }
-        //! Transfers ownership to caller; destructor becomes a no-op.
-        void disconnect() { mNewNode = nullptr; }
-
-        ~NoLeakAlloc()
-        {
-            if (mNewNode) mBase->deallocateNode(mNewNode);
-        }
-    };
+    [[nodiscard]] allocator_type getAllocator() const noexcept { return mNodeAlloc; }
 
 protected:
-    allocator_type mNodeAlloc;
+    KDTREE_NO_UNIQUE_ADDRESS allocator_type mNodeAlloc;
 
-    NodeType* allocateNode() { return mNodeAlloc.allocate(1); }
-
-    void deallocateNode(NodeType* const pNode) { mNodeAlloc.deallocate(pNode, 1); }
-
-    void constructNode(NodeType* pNode, Tp const& refVal = Tp(), BasePtr const pParent = nullptr,
-                       BasePtr const pLeft = nullptr, BasePtr const pRight = nullptr)
+    //! Allocates and constructs a node holding `Tp(args...)`. Strong exception guarantee.
+    template <typename... Args>
+    [[nodiscard]] NodeType* createNode(Args&&... args)
     {
-        new (pNode) NodeType(refVal, pParent, pLeft, pRight);
+        NodeType* const pNode = std::to_address(AllocTraits::allocate(mNodeAlloc, 1));
+        try {
+            AllocTraits::construct(mNodeAlloc, pNode, std::in_place, std::forward<Args>(args)...);
+        } catch (...) {
+            AllocTraits::deallocate(mNodeAlloc, pNode, 1);
+            throw;
+        }
+        return pNode;
     }
 
-    void destroyNode(NodeType* pNode) { pNode->~NodeType(); }
+    //! Destroys and frees a node created by \ref createNode.
+    void deleteNode(NodeType* const pNode) noexcept
+    {
+        AllocTraits::destroy(mNodeAlloc, pNode);
+        AllocTraits::deallocate(mNodeAlloc, pNode, 1);
+    }
 };
 
 }  // namespace libkdtree
