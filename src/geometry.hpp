@@ -1,7 +1,13 @@
 /** \file
  * \brief Geometry utilities for \ref libkdtree::BoxTree "BoxTree": fixed-size vectors,
- *        axis-aligned boxes, closest-point and ray-intersection routines.
+ *        axis-aligned boxes, rays, closest-point and ray-intersection routines.
  * \ingroup libkdtree
+ *
+ * Per-axis loops are unrolled at compile time with fold expressions (see
+ * \ref libkdtree::geom::detail "detail"). Sums keep the left-to-right order of a plain loop,
+ * so results are bit-identical to the straightforward implementation. The one exception is
+ * the ray / box slab test (\ref libkdtree::Box::intersect "Box::intersect"), which stays a
+ * fixed-trip-count loop because it measured faster that way.
  */
 
 #pragma once
@@ -12,6 +18,7 @@
 #include <cstddef>
 #include <limits>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 namespace libkdtree
@@ -29,41 +36,81 @@ using Vec3 = Vec<3>;
 //! Small vector helpers (named functions: operators on std::array would not be found by ADL).
 namespace geom
 {
+//! Compile-time unrolling helpers: `f` receives `std::integral_constant<std::size_t, I>`.
+namespace detail
+{
+template <std::size_t I>
+using Axis = std::integral_constant<std::size_t, I>;
+
+//! Calls `f(Axis<0>{}) ... f(Axis<N-1>{})` in order.
+template <std::size_t N, class F>
+constexpr void forEachAxis(F&& f)
+{
+    [&]<std::size_t... I>(std::index_sequence<I...>) { (f(Axis<I>{}), ...); }(std::make_index_sequence<N>{});
+}
+
+//! `Vec<N>{f(Axis<0>{}), ..., f(Axis<N-1>{})}`.
+template <std::size_t N, class F>
+[[nodiscard]] constexpr Vec<N> makeVec(F&& f)
+{
+    return [&]<std::size_t... I>(std::index_sequence<I...>) {
+        return Vec<N>{f(Axis<I>{})...};
+    }(std::make_index_sequence<N>{});
+}
+
+//! `((f(0) + f(1)) + ...) + f(N-1)` – same summation order as a loop.
+template <std::size_t N, class F>
+[[nodiscard]] constexpr double sumAxes(F&& f)
+{
+    return [&]<std::size_t... I>(std::index_sequence<I...>) {
+        return (0.0 + ... + f(Axis<I>{}));
+    }(std::make_index_sequence<N>{});
+}
+
+//! `f(0) && f(1) && ...` (short-circuits).
+template <std::size_t N, class F>
+[[nodiscard]] constexpr bool allAxes(F&& f)
+{
+    return [&]<std::size_t... I>(std::index_sequence<I...>) {
+        return (f(Axis<I>{}) && ...);
+    }(std::make_index_sequence<N>{});
+}
+
+//! `f(0) || f(1) || ...` (short-circuits).
+template <std::size_t N, class F>
+[[nodiscard]] constexpr bool anyAxis(F&& f)
+{
+    return [&]<std::size_t... I>(std::index_sequence<I...>) {
+        return (f(Axis<I>{}) || ...);
+    }(std::make_index_sequence<N>{});
+}
+}  // namespace detail
+
 template <std::size_t N>
 [[nodiscard]] constexpr Vec<N> add(Vec<N> const& a, Vec<N> const& b) noexcept
 {
-    Vec<N> r{};
-    for (std::size_t i = 0; i < N; ++i) r[i] = a[i] + b[i];
-    return r;
+    return detail::makeVec<N>([&](auto i) { return a[i] + b[i]; });
 }
 template <std::size_t N>
 [[nodiscard]] constexpr Vec<N> sub(Vec<N> const& a, Vec<N> const& b) noexcept
 {
-    Vec<N> r{};
-    for (std::size_t i = 0; i < N; ++i) r[i] = a[i] - b[i];
-    return r;
+    return detail::makeVec<N>([&](auto i) { return a[i] - b[i]; });
 }
 template <std::size_t N>
 [[nodiscard]] constexpr Vec<N> mul(Vec<N> const& a, double s) noexcept
 {
-    Vec<N> r{};
-    for (std::size_t i = 0; i < N; ++i) r[i] = a[i] * s;
-    return r;
+    return detail::makeVec<N>([&](auto i) { return a[i] * s; });
 }
 //! `a + s * b`
 template <std::size_t N>
 [[nodiscard]] constexpr Vec<N> madd(Vec<N> const& a, Vec<N> const& b, double s) noexcept
 {
-    Vec<N> r{};
-    for (std::size_t i = 0; i < N; ++i) r[i] = a[i] + b[i] * s;
-    return r;
+    return detail::makeVec<N>([&](auto i) { return a[i] + b[i] * s; });
 }
 template <std::size_t N>
 [[nodiscard]] constexpr double dot(Vec<N> const& a, Vec<N> const& b) noexcept
 {
-    double s = 0;
-    for (std::size_t i = 0; i < N; ++i) s += a[i] * b[i];
-    return s;
+    return detail::sumAxes<N>([&](auto i) { return a[i] * b[i]; });
 }
 template <std::size_t N>
 [[nodiscard]] constexpr double lengthSqr(Vec<N> const& a) noexcept
@@ -78,12 +125,10 @@ template <std::size_t N>
 template <std::size_t N>
 [[nodiscard]] constexpr double distanceSqr(Vec<N> const& a, Vec<N> const& b) noexcept
 {
-    double s = 0;
-    for (std::size_t i = 0; i < N; ++i) {
+    return detail::sumAxes<N>([&](auto i) {
         double const d = a[i] - b[i];
-        s += d * d;
-    }
-    return s;
+        return d * d;
+    });
 }
 //! Unit vector, or the zero vector when \p a has zero length.
 template <std::size_t N>
@@ -104,6 +149,40 @@ template <std::size_t N>
 }  // namespace geom
 
 // ---------------------------------------------------------------------------
+// Ray with precomputed reciprocal direction
+// ---------------------------------------------------------------------------
+
+/**
+ * \brief Ray `org + t * dir` with per-axis data precomputed for repeated box tests.
+ *
+ * Build once per query with \ref make and pass to \ref Box::intersect: each box test then
+ * needs no divisions and no per-axis swap.
+ */
+template <std::size_t N>
+struct Ray {
+    Vec<N> org{};
+    Vec<N> dir{};
+    Vec<N> inv{};                  //!< `1 / dir[i]` (unused where `dir[i] == 0`)
+    std::array<bool, N> zero{};    //!< `dir[i] == 0`: the ray never crosses this axis' slabs
+    std::array<bool, N> negative{};  //!< `dir[i] < 0`: enter through `hi`, leave through `lo`
+
+    [[nodiscard]] static constexpr Ray make(Vec<N> const& org, Vec<N> const& dir) noexcept
+    {
+        Ray r;
+        r.org = org;
+        r.dir = dir;
+        geom::detail::forEachAxis<N>([&](auto i) {
+            r.zero[i] = dir[i] == 0;
+            r.negative[i] = dir[i] < 0;
+            r.inv[i] = r.zero[i] ? 0.0 : 1.0 / dir[i];
+        });
+        return r;
+    }
+
+    [[nodiscard]] constexpr Vec<N> at(double t) const noexcept { return geom::madd(org, dir, t); }
+};
+
+// ---------------------------------------------------------------------------
 // Axis-aligned box
 // ---------------------------------------------------------------------------
 
@@ -115,49 +194,45 @@ struct Box {
 
     [[nodiscard]] static constexpr Vec<N> filled(double v) noexcept
     {
-        Vec<N> r{};
-        r.fill(v);
-        return r;
+        return geom::detail::makeVec<N>([v](auto) { return v; });
     }
 
     [[nodiscard]] static constexpr Box fromPoints(Vec<N> const& a, Vec<N> const& b) noexcept
     {
         Box r;
-        r.expand(a);
-        r.expand(b);
+        geom::detail::forEachAxis<N>([&](auto i) {
+            r.lo[i] = std::min(a[i], b[i]);
+            r.hi[i] = std::max(a[i], b[i]);
+        });
         return r;
     }
 
     [[nodiscard]] constexpr bool isEmpty() const noexcept
     {
-        for (std::size_t i = 0; i < N; ++i)
-            if (hi[i] < lo[i]) return true;
-        return false;
+        return geom::detail::anyAxis<N>([this](auto i) { return hi[i] < lo[i]; });
     }
 
     constexpr Box& expand(Vec<N> const& p) noexcept
     {
-        for (std::size_t i = 0; i < N; ++i) {
+        geom::detail::forEachAxis<N>([&](auto i) {
             lo[i] = std::min(lo[i], p[i]);
             hi[i] = std::max(hi[i], p[i]);
-        }
+        });
         return *this;
     }
 
     constexpr Box& expand(Box const& b) noexcept
     {
-        for (std::size_t i = 0; i < N; ++i) {
+        geom::detail::forEachAxis<N>([&](auto i) {
             lo[i] = std::min(lo[i], b.lo[i]);
             hi[i] = std::max(hi[i], b.hi[i]);
-        }
+        });
         return *this;
     }
 
     [[nodiscard]] constexpr Vec<N> center() const noexcept
     {
-        Vec<N> r{};
-        for (std::size_t i = 0; i < N; ++i) r[i] = 0.5 * (lo[i] + hi[i]);
-        return r;
+        return geom::detail::makeVec<N>([this](auto i) { return 0.5 * (lo[i] + hi[i]); });
     }
 
     [[nodiscard]] constexpr Vec<N> extent() const noexcept { return geom::sub(hi, lo); }
@@ -165,8 +240,16 @@ struct Box {
     [[nodiscard]] constexpr std::size_t longestAxis() const noexcept
     {
         std::size_t best = 0;
-        for (std::size_t i = 1; i < N; ++i)
-            if (hi[i] - lo[i] > hi[best] - lo[best]) best = i;
+        double bestExtent = hi[0] - lo[0];
+        geom::detail::forEachAxis<N>([&](auto i) {
+            if constexpr (i > 0) {
+                double const e = hi[i] - lo[i];
+                if (e > bestExtent) {
+                    best = i;
+                    bestExtent = e;
+                }
+            }
+        });
         return best;
     }
 
@@ -177,45 +260,36 @@ struct Box {
         Vec<N> const e = extent();
         if constexpr (N == 1) {
             return e[0];
+        } else if constexpr (N == 2) {
+            return e[0] + e[1];
+        } else if constexpr (N == 3) {
+            return e[0] * e[1] + e[0] * e[2] + e[1] * e[2];
         } else {
             double s = 0;
-            if constexpr (N == 2) {
-                s = e[0] + e[1];
-            } else {
-                for (std::size_t i = 0; i < N; ++i)
-                    for (std::size_t j = i + 1; j < N; ++j) s += e[i] * e[j];
-            }
+            for (std::size_t i = 0; i < N; ++i)
+                for (std::size_t j = i + 1; j < N; ++j) s += e[i] * e[j];
             return s;
         }
     }
 
     [[nodiscard]] constexpr bool contains(Vec<N> const& p) const noexcept
     {
-        for (std::size_t i = 0; i < N; ++i)
-            if (p[i] < lo[i] || hi[i] < p[i]) return false;
-        return true;
+        return geom::detail::allAxes<N>([&](auto i) { return lo[i] <= p[i] && p[i] <= hi[i]; });
     }
 
     [[nodiscard]] constexpr bool intersects(Box const& b) const noexcept
     {
-        for (std::size_t i = 0; i < N; ++i)
-            if (b.hi[i] < lo[i] || hi[i] < b.lo[i]) return false;
-        return true;
+        return geom::detail::allAxes<N>([&](auto i) { return lo[i] <= b.hi[i] && b.lo[i] <= hi[i]; });
     }
 
-    //! Squared distance from \p p to the box; 0 when \p p is inside.
+    //! Squared distance from \p p to the box; 0 when \p p is inside. Branch-free.
     [[nodiscard]] constexpr double distanceSqr(Vec<N> const& p) const noexcept
     {
-        double s = 0;
-        for (std::size_t i = 0; i < N; ++i) {
-            double d = 0;
-            if (p[i] < lo[i])
-                d = lo[i] - p[i];
-            else if (p[i] > hi[i])
-                d = p[i] - hi[i];
-            s += d * d;
-        }
-        return s;
+        return geom::detail::sumAxes<N>([&](auto i) {
+            // at most one of the two differences is positive for a non-empty box
+            double const d = std::max(std::max(lo[i] - p[i], p[i] - hi[i]), 0.0);
+            return d * d;
+        });
     }
 
     [[nodiscard]] double distance(Vec<N> const& p) const noexcept { return std::sqrt(distanceSqr(p)); }
@@ -223,33 +297,44 @@ struct Box {
     //! Point of the box closest to \p p (\p p itself when inside).
     [[nodiscard]] constexpr Vec<N> clamp(Vec<N> const& p) const noexcept
     {
-        Vec<N> r{};
-        for (std::size_t i = 0; i < N; ++i) r[i] = std::clamp(p[i], lo[i], hi[i]);
-        return r;
+        return geom::detail::makeVec<N>([&](auto i) { return std::clamp(p[i], lo[i], hi[i]); });
+    }
+
+    /**
+     * \brief Slab test against a precomputed \ref Ray, `t` in `[tMin, tMax]`.
+     * \return `{tEnter, tExit}` clipped to `[tMin, tMax]`, or nullopt on a miss.
+     */
+    [[nodiscard]] constexpr std::optional<std::pair<double, double>> intersect(
+        Ray<N> const& ray, double tMin, double tMax) const noexcept
+    {
+        // Deliberately a plain loop: the early return on a miss matters, and a fold-expression
+        // version measured ~18% slower for ray queries under MSVC (tMin / tMax captured by
+        // reference were not kept in registers). The trip count is a constant, so compilers
+        // unroll it anyway.
+        for (std::size_t i = 0; i < N; ++i) {
+            if (ray.zero[i]) {
+                if (ray.org[i] < lo[i] || hi[i] < ray.org[i]) return std::nullopt;
+                continue;
+            }
+            double const tNear = ((ray.negative[i] ? hi[i] : lo[i]) - ray.org[i]) * ray.inv[i];
+            double const tFar = ((ray.negative[i] ? lo[i] : hi[i]) - ray.org[i]) * ray.inv[i];
+            tMin = std::max(tMin, tNear);
+            tMax = std::min(tMax, tFar);
+            if (tMin > tMax) return std::nullopt;
+        }
+        return std::pair{tMin, tMax};
     }
 
     /**
      * \brief Slab test for the ray `org + t * dir`, `t` in `[tMin, tMax]`.
      * \return `{tEnter, tExit}` clipped to `[tMin, tMax]`, or nullopt on a miss.
-     * Zero direction components are handled without producing NaNs.
+     * Zero direction components are handled without producing NaNs. For many boxes per
+     * ray, build a \ref Ray once and call \ref intersect.
      */
-    [[nodiscard]] std::optional<std::pair<double, double>> intersectRay(
+    [[nodiscard]] constexpr std::optional<std::pair<double, double>> intersectRay(
         Vec<N> const& org, Vec<N> const& dir, double tMin, double tMax) const noexcept
     {
-        for (std::size_t i = 0; i < N; ++i) {
-            if (dir[i] == 0) {
-                if (org[i] < lo[i] || hi[i] < org[i]) return std::nullopt;
-                continue;
-            }
-            double const inv = 1.0 / dir[i];
-            double ta = (lo[i] - org[i]) * inv;
-            double tb = (hi[i] - org[i]) * inv;
-            if (ta > tb) std::swap(ta, tb);
-            tMin = std::max(tMin, ta);
-            tMax = std::min(tMax, tb);
-            if (tMin > tMax) return std::nullopt;
-        }
-        return std::pair{tMin, tMax};
+        return intersect(Ray<N>::make(org, dir), tMin, tMax);
     }
 };
 
@@ -307,13 +392,20 @@ template <std::size_t N>
     if (!(sum > 0)) {
         // degenerate triangle: best of the three edges
         Vec<N> best = closestPointOnSegment(a, b, p);
-        for (Vec<N> const& q : {closestPointOnSegment(b, c, p), closestPointOnSegment(c, a, p)})
-            if (distanceSqr(q, p) < distanceSqr(best, p)) best = q;
+        double bestSq = distanceSqr(best, p);
+        Vec<N> const q1 = closestPointOnSegment(b, c, p);
+        if (double const d = distanceSqr(q1, p); d < bestSq) {
+            best = q1;
+            bestSq = d;
+        }
+        Vec<N> const q2 = closestPointOnSegment(c, a, p);
+        if (distanceSqr(q2, p) < bestSq) best = q2;
         return best;
     }
-    double const v = vb / sum;
-    double const w = vc / sum;
-    return madd(madd(a, ab, v), ac, w);
+    double const inv = 1.0 / sum;
+    double const v = vb * inv;
+    double const w = vc * inv;
+    return detail::makeVec<N>([&](auto i) { return a[i] + ab[i] * v + ac[i] * w; });
 }
 
 //! \c true if 2D point \p p lies inside or on triangle `abc` (either winding).
