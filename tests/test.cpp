@@ -12,6 +12,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -1618,4 +1619,254 @@ TEST(BoxTree, AppendFinishAndIndices)
     tree.reset();
     EXPECT_TRUE(tree.empty());
     EXPECT_FALSE(tree.closestPoint(Vec3{0, 0, 0}).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Signed distance where several primitives share the closest point (edges, vertices)
+// ---------------------------------------------------------------------------
+
+namespace
+{
+using Mesh = std::vector<Triangle<3>>;
+using Poly2 = std::vector<Vec2>;
+
+//! Closed prism: counter-clockwise polygon \p poly extruded over z in [0, len], outward faces.
+Mesh extrude(Poly2 const& poly, double len)
+{
+    Vec2 ctr{0, 0};
+    for (auto const& p : poly) ctr = geom::add(ctr, p);
+    ctr = geom::mul(ctr, 1.0 / static_cast<double>(poly.size()));
+    Vec3 const cb{ctr[0], ctr[1], 0}, ct{ctr[0], ctr[1], len};
+    Mesh m;
+    for (std::size_t i = 0; i < poly.size(); ++i) {
+        Vec2 const p = poly[i], q = poly[(i + 1) % poly.size()];
+        Vec3 const b0{p[0], p[1], 0}, b1{q[0], q[1], 0}, t0{p[0], p[1], len}, t1{q[0], q[1], len};
+        m.push_back({b0, b1, t1});
+        m.push_back({b0, t1, t0});
+        m.push_back({ct, t0, t1});
+        m.push_back({cb, b1, b0});
+    }
+    return m;
+}
+
+//! Rotation about a fixed off-axis direction, then uniform scale, then translation.
+struct Placement {
+    double scale = 1;
+    Vec3 offset{0, 0, 0};
+
+    [[nodiscard]] Vec3 operator()(Vec3 const& p) const
+    {
+        Vec3 const k = geom::normalize(Vec3{1, 2, 3});
+        double const a = 0.7;
+        Vec3 const r = geom::add(geom::add(geom::mul(p, std::cos(a)), geom::mul(geom::cross(k, p), std::sin(a))),
+                                 geom::mul(k, geom::dot(k, p) * (1 - std::cos(a))));
+        return geom::madd(offset, r, scale);
+    }
+    [[nodiscard]] Mesh operator()(Mesh m) const
+    {
+        for (auto& t : m) t = {(*this)(t.a), (*this)(t.b), (*this)(t.c)};
+        return m;
+    }
+    [[nodiscard]] std::string str() const
+    {
+        std::ostringstream os;
+        os << "scale " << scale << ", offset " << geom::length(offset);
+        return os.str();
+    }
+};
+
+//! Offsets 0 / 10 / 100 times scales 1 / 0.1 / 0.01.
+std::vector<Placement> placements()
+{
+    std::vector<Placement> out;
+    for (double off : {0.0, 10.0, 100.0})
+        for (double s : {1.0, 0.1, 0.01})
+            out.push_back({s, Vec3{off * 0.83, off * -0.41, off * 0.37}});
+    return out;
+}
+
+//! Generalised winding number (signed solid angles / 4 pi): ~1 inside, ~0 outside.
+double windingNumber(Mesh const& m, Vec3 const& p)
+{
+    double total = 0;
+    for (auto const& t : m) {
+        Vec3 const a = geom::sub(t.a, p), b = geom::sub(t.b, p), c = geom::sub(t.c, p);
+        double const la = geom::length(a), lb = geom::length(b), lc = geom::length(c);
+        double const det = geom::dot(a, geom::cross(b, c));
+        double const den = la * lb * lc + geom::dot(a, b) * lc + geom::dot(b, c) * la + geom::dot(c, a) * lb;
+        total += 2 * std::atan2(det, den);
+    }
+    return total / (4 * std::numbers::pi);
+}
+
+double degToRad(double d) { return d * std::numbers::pi / 180; }
+
+Poly2 starPolygon(int points, double inner, Vec2 center)
+{
+    Poly2 star;
+    for (int i = 0; i < 2 * points; ++i) {
+        double const a = std::numbers::pi * i / points, r = (i % 2) ? inner : 1.0;
+        star.push_back({center[0] + r * std::cos(a), center[1] + r * std::sin(a)});
+    }
+    return star;
+}
+}  // namespace
+
+TEST(BoxTreeSignedDistance, SharpCreaseSignsAcrossPlacements)
+{
+    // prism whose cross-section is an isosceles triangle with an 11 degree apex at (0, 1)
+    double const half = 5.5;
+    double const w = std::tan(degToRad(half));
+    Mesh const local = extrude({{-w, 0}, {w, 0}, {0, 1}}, 2.0);
+    for (Placement const& pl : placements()) {
+        Mesh const mesh = pl(local);
+        BoxTree<Triangle<3>> const tree(mesh);
+        std::mt19937 rng(101);
+        // directions (from +y) whose closest feature is the apex edge
+        std::uniform_real_distribution<double> phi(-(90 - half) + 0.5, (90 - half) - 0.5);
+        std::uniform_real_distribution<double> dist(1e-3, 0.3), z(0.4, 1.6), frac(-0.5, 0.5);
+        int wrongOut = 0, wrongIn = 0;
+        for (int i = 0; i < 2000; ++i) {
+            double const f = degToRad(phi(rng)), t = dist(rng), zz = z(rng);
+            Vec3 const out = pl(Vec3{t * std::sin(f), 1 + t * std::cos(f), zz});
+            auto const sd = tree.closestPointSignedDistance(out);
+            ASSERT_TRUE(sd.has_value());
+            ASSERT_NEAR(std::abs(*sd), t * pl.scale, 1e-9 * (1 + geom::length(pl.offset)));
+            if (!(*sd > 0)) ++wrongOut;
+            double const tin = dist(rng);  // just inside, below the apex
+            Vec3 const in = pl(Vec3{frac(rng) * tin * w, 1 - tin, zz});
+            if (!(*tree.closestPointSignedDistance(in) < 0)) ++wrongIn;
+        }
+        EXPECT_EQ(wrongOut, 0) << pl.str() << ": outside points beyond the crease reported inside";
+        EXPECT_EQ(wrongIn, 0) << pl.str() << ": inside points below the crease reported outside";
+    }
+}
+
+TEST(BoxTreeSignedDistance, SharpVertexMatchesWindingNumber)
+{
+    // thin triangular pyramid: its tip is a vertex shared by three steep faces
+    double const rb = std::tan(degToRad(6.0));
+    Vec3 const tip{0, 0, 1};
+    std::array<Vec3, 3> base;
+    for (int i = 0; i < 3; ++i)
+        base[static_cast<std::size_t>(i)] = {rb * std::cos(2 * std::numbers::pi * i / 3),
+                                             rb * std::sin(2 * std::numbers::pi * i / 3), 0};
+    Mesh const local{{base[0], base[1], tip}, {base[1], base[2], tip}, {base[2], base[0], tip},
+                     {base[0], base[2], base[1]}};
+    for (Placement const& pl : placements()) {
+        Mesh const mesh = pl(local);
+        BoxTree<Triangle<3>> const tree(mesh);
+        Vec3 const wtip = pl(tip);
+        std::mt19937 rng(102);
+        std::uniform_real_distribution<double> dist(1e-3, 0.3);
+        int atTip = 0, wrong = 0;
+        for (int i = 0; i < 4000; ++i) {
+            Vec3 const u = randomDirection(rng);
+            if (u[2] < 0) continue;
+            Vec3 const p = pl(geom::madd(tip, u, dist(rng)));
+            Vec3 cp{};
+            Triangle<3> const* tri = nullptr;
+            auto const sd = tree.closestPointSignedDistance(p, cp, tri);
+            ASSERT_TRUE(sd.has_value());
+            if (geom::distanceSqr(cp, wtip) > 0) continue;  // keep queries closest to the tip itself
+            ++atTip;
+            if ((*sd < 0) != (windingNumber(mesh, p) > 0.5)) ++wrong;
+        }
+        EXPECT_GT(atTip, 300) << pl.str();
+        EXPECT_EQ(wrong, 0) << pl.str() << " (" << atTip << " queries closest to the tip)";
+    }
+}
+
+TEST(BoxTreeSignedDistance, NonManifoldEdgeGapIsOutside)
+{
+    // two thin wedges sharing their apex edge (the z axis): four faces meet at one edge
+    auto wedge = [](double a0, double a1) {
+        return extrude({{0, 0},
+                        {std::cos(degToRad(a0)), std::sin(degToRad(a0))},
+                        {std::cos(degToRad(a1)), std::sin(degToRad(a1))}},
+                       2.0);
+    };
+    Mesh local = wedge(0, 11);
+    for (auto const& t : wedge(40, 51)) local.push_back(t);
+    for (Placement const& pl : placements()) {
+        Mesh const mesh = pl(local);
+        BoxTree<Triangle<3>> const tree(mesh);
+        std::mt19937 rng(103);
+        // in the gap the shared edge is the closest feature for angles in [141, 270] degrees
+        std::uniform_real_distribution<double> ang(145, 265), dist(1e-3, 0.3), z(0.5, 1.5), in(0.2, 0.8);
+        int wrongGap = 0, wrongIn = 0;
+        for (int i = 0; i < 2000; ++i) {
+            double const a = degToRad(ang(rng)), t = dist(rng), zz = z(rng);
+            Vec3 const p = pl(Vec3{t * std::cos(a), t * std::sin(a), zz});
+            auto const sd = tree.closestPointSignedDistance(p);
+            ASSERT_TRUE(sd.has_value());
+            ASSERT_NEAR(std::abs(*sd), t * pl.scale, 1e-9 * (1 + geom::length(pl.offset)));
+            if (!(*sd > 0)) ++wrongGap;
+            // inside either wedge, near the shared edge
+            double const ai = degToRad((i % 2 ? 40 : 0) + 11 * in(rng));
+            Vec3 const q = pl(Vec3{t * std::cos(ai), t * std::sin(ai), zz});
+            if (!(*tree.closestPointSignedDistance(q) < 0)) ++wrongIn;
+        }
+        EXPECT_EQ(wrongGap, 0) << pl.str() << ": points in the gap reported inside";
+        EXPECT_EQ(wrongIn, 0) << pl.str() << ": points inside a wedge reported outside";
+    }
+}
+
+TEST(BoxTreeSignedDistance, StarPrismMatchesWindingNumber)
+{
+    // closed non-convex mesh with sharp convex tips and reflex edges
+    Poly2 const star = starPolygon(7, 0.25, {0, 0});
+    Mesh const local = extrude(star, 1.0);
+    for (Placement const& pl : placements()) {
+        Mesh const mesh = pl(local);
+        BoxTree<Triangle<3>> const tree(mesh);
+        std::mt19937 rng(104);
+        std::uniform_real_distribution<double> box(-1.3, 1.3), zr(-0.3, 1.3), small(-0.05, 0.05);
+        std::uniform_int_distribution<std::size_t> pick(0, star.size() - 1);
+        int wrong = 0, checked = 0;
+        for (int i = 0; i < 3000; ++i) {
+            Vec3 lp;
+            if (i % 2) {
+                lp = {box(rng), box(rng), zr(rng)};
+            } else {  // near a tip or reflex vertex, on the cap rims
+                Vec2 const v = star[pick(rng)];
+                lp = {v[0] + small(rng), v[1] + small(rng), (i % 4 ? 0.0 : 1.0) + small(rng)};
+            }
+            Vec3 const p = pl(lp);
+            double const sd = *tree.closestPointSignedDistance(p);
+            if (std::abs(sd) < 1e-9 * pl.scale) continue;
+            double const wn = windingNumber(mesh, p);
+            ASSERT_LT(std::min(std::abs(wn), std::abs(wn - 1)), 1e-6) << "bad ground truth";
+            ++checked;
+            if ((sd < 0) != (wn > 0.5)) ++wrong;
+        }
+        EXPECT_GT(checked, 2900) << pl.str();
+        EXPECT_EQ(wrong, 0) << pl.str() << " (" << checked << " checked)";
+    }
+}
+
+TEST(BoxTreeSignedDistance, SharpPolygonCorners2D)
+{
+    // counter-clockwise star polygon away from the origin: Segment<2> normals point outward
+    Poly2 const star = starPolygon(7, 0.25, {10, -7});
+    std::vector<Segment<2>> segs;
+    for (std::size_t i = 0; i < star.size(); ++i) segs.push_back({star[i], star[(i + 1) % star.size()]});
+    libkdtree::ClosestPoint2D<> tree(segs);
+    std::mt19937 rng(105);
+    std::uniform_real_distribution<double> small(-0.2, 0.2);
+    std::uniform_int_distribution<std::size_t> pick(0, star.size() - 1);
+    int wrong = 0;
+    for (int i = 0; i < 4000; ++i) {
+        Vec2 const v = star[pick(rng)];
+        Vec2 const p{v[0] + small(rng), v[1] + small(rng)};
+        double const sd = *tree.closestPointSignedDistance(p);
+        if (std::abs(sd) < 1e-12) continue;
+        int crossings = 0;  // ray parity along +x
+        for (auto const& s : segs)
+            if ((s.a[1] > p[1]) != (s.b[1] > p[1]) &&
+                s.a[0] + (p[1] - s.a[1]) * (s.b[0] - s.a[0]) / (s.b[1] - s.a[1]) > p[0])
+                ++crossings;
+        if ((sd < 0) != (crossings % 2 == 1)) ++wrong;
+    }
+    EXPECT_EQ(wrong, 0);
 }
