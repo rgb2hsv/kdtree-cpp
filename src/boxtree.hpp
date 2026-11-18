@@ -77,9 +77,26 @@ struct Triangle {
  *  - `static std::optional<double> intersectRay(Prim const&, Vec<dimension> const& org, Vec<dimension> const& dir);`
  *    returns the smallest `t >= 0` with `org + t*dir` on the primitive; enables
  *    `intersectRayDistance` / `intersectSegmentDistance`.
+ *  - `static ConeAlignment<dimension> coneAlignment(Prim const&, Vec<dimension> const& pointOnPrim,
+ *    Vec<dimension> const& query, double snap);` refines the sign of
+ *    `closestPointSignedDistance` where several primitives share the closest point at a vertex
+ *    (see \ref ConeAlignment). Without it, ties are broken by normal alignment alone, which is
+ *    exact for 2D corners and 3D edges but not for 3D vertices.
  */
 template <class Prim>
 struct PrimitiveTraits;
+
+/**
+ * \brief How a primitive's tangent cone at a point faces a query point.
+ *
+ * The tangent cone is the set of directions from \ref apex into the primitive (for a triangle:
+ * the whole plane at an interior point, a half-plane on an edge, a sector at a vertex).
+ */
+template <std::size_t N>
+struct ConeAlignment {
+    Vec<N> apex{};         //!< the point on the primitive, or the vertex it was snapped to
+    double cosAngle = -1;  //!< cosine of the angle from `query - apex` to the nearest cone direction
+};
 
 template <class Traits, class Prim>
 concept BoxPrimitiveTraits = requires(Prim const& p, Vec<Traits::dimension> const& q) {
@@ -96,6 +113,11 @@ concept HasPrimitiveNormal = requires(Prim const& p, Vec<Traits::dimension> cons
 template <class Traits, class Prim>
 concept HasRayIntersection = requires(Prim const& p, Vec<Traits::dimension> const& o) {
     { Traits::intersectRay(p, o, o) } -> std::convertible_to<std::optional<double>>;
+};
+
+template <class Traits, class Prim>
+concept HasConeAlignment = requires(Prim const& p, Vec<Traits::dimension> const& q) {
+    { Traits::coneAlignment(p, q, q, 0.0) } -> std::convertible_to<ConeAlignment<Traits::dimension>>;
 };
 
 template <std::size_t N>
@@ -139,6 +161,43 @@ struct PrimitiveTraits<Triangle<N>> {
         requires(N == 3)
     {
         return geom::normalize(geom::cross(geom::sub(t.b, t.a), geom::sub(t.c, t.a)));
+    }
+    //! Tangent cone at \p q (snapped to a vertex within \p snap), seen from \p query.
+    static ConeAlignment<N> coneAlignment(Triangle<N> const& t, Vec<N> const& q, Vec<N> const& query,
+                                          double snap) noexcept
+        requires(N == 3)
+    {
+        std::array<Vec<N>, 3> const v{t.a, t.b, t.c};
+        double const minEdgeSqr =
+            std::min({geom::distanceSqr(t.a, t.b), geom::distanceSqr(t.b, t.c), geom::distanceSqr(t.c, t.a)});
+        double bestSq = std::min(snap * snap, 0.0625 * minEdgeSqr);  // never snap across the triangle
+        std::size_t k = 3;                                             // snapped vertex, 3 = none
+        for (std::size_t i = 0; i < 3; ++i)
+            if (double const d2 = geom::distanceSqr(v[i], q); d2 <= bestSq) {
+                bestSq = d2;
+                k = i;
+            }
+        ConeAlignment<N> out{k < 3 ? v[k] : q, -1.0};
+        Vec<N> const n = normal(t, q);
+        Vec<N> const dir = geom::normalize(geom::sub(query, out.apex));
+        if (geom::lengthSqr(n) == 0 || geom::lengthSqr(dir) == 0) return out;  // degenerate
+
+        // The cone is the union of the sectors (apex; v[i] -> v[j]) over edges (i, j) not touching
+        // the apex; a sector spanning ~180 degrees is the edge the apex lies on and is skipped.
+        Vec<N> const inPlane = geom::madd(dir, n, -geom::dot(dir, n));
+        std::array<Vec<N>, 3> g{};
+        for (std::size_t i = 0; i < 3; ++i) g[i] = geom::normalize(geom::sub(v[i], out.apex));
+        bool inside = false;
+        for (std::size_t i = 0; i < 3; ++i) {
+            if (i == k) continue;
+            out.cosAngle = std::max(out.cosAngle, geom::dot(dir, g[i]));
+            std::size_t const j = (i + 1) % 3;
+            if (j == k || !(geom::dot(geom::cross(g[i], g[j]), n) > 1e-9)) continue;
+            if (geom::dot(geom::cross(g[i], inPlane), n) >= 0 && geom::dot(geom::cross(inPlane, g[j]), n) >= 0)
+                inside = true;
+        }
+        if (inside) out.cosAngle = geom::length(inPlane);
+        return out;
     }
     static std::optional<double> intersectRay(Triangle<N> const& t, Vec<N> const& o,
                                               Vec<N> const& d) noexcept
@@ -195,6 +254,14 @@ struct PrimitiveTraits<std::variant<P0, Ps...>> {
     {
         return std::visit([&q](auto const& p) -> V { return traitsOf(p).normal(p, q); }, v);
     }
+    static ConeAlignment<dimension> coneAlignment(Variant const& v, V const& q, V const& query, double snap)
+        requires(HasConeAlignment<PrimitiveTraits<P0>, P0> &&
+                 (HasConeAlignment<PrimitiveTraits<Ps>, Ps> && ...))
+    {
+        return std::visit(
+            [&](auto const& p) -> ConeAlignment<dimension> { return traitsOf(p).coneAlignment(p, q, query, snap); },
+            v);
+    }
     static std::optional<double> intersectRay(Variant const& v, V const& o, V const& d)
         requires(HasRayIntersection<PrimitiveTraits<P0>, P0> &&
                  (HasRayIntersection<PrimitiveTraits<Ps>, Ps> && ...))
@@ -245,6 +312,7 @@ public:
     static constexpr std::size_t N = Traits::dimension;
     static constexpr bool kHasNormal = HasPrimitiveNormal<Traits, Prim>;
     static constexpr bool kHasRay = HasRayIntersection<Traits, Prim>;
+    static constexpr bool kHasConeAlignment = HasConeAlignment<Traits, Prim>;
     //! Hard cap on tree depth (keeps the traversal stack fixed-size).
     static constexpr std::size_t kMaxDepthLimit = 64;
     //! Leaves hold at most this many primitives unless \ref maxDepth forces a larger leaf.
@@ -567,21 +635,24 @@ public:
     /**
      * \brief Distance to the closest primitive, signed by the primitive's normal at the closest
      *        point: positive on the side the normal points to, negative behind, 0 on the surface.
+     *
+     * When several primitives share the closest point (an edge or vertex of a mesh), the sign
+     * comes from the one whose surface is angularly nearest to the query direction, so points
+     * beyond sharp creases, spike tips and non-manifold edges get the correct sign without mesh
+     * connectivity. `lastPrimitive` / `lastPoint` report that primitive.
      */
     std::optional<double> closestPointSignedDistance(point_type const& r, point_type& lastPoint,
                                                      Prim const*& lastPrimitive) const
         requires kHasNormal
     {
-        auto const d = closestPoint(r, lastPoint, lastPrimitive);  // must run before reading the out-params
-        return signedFrom(r, d, lastPoint, lastPrimitive);
+        return signedImpl(r, std::numeric_limits<double>::infinity(), lastPoint, lastPrimitive);
     }
     std::optional<double> closestPointSignedDistance(point_type const& r, double maxDistance,
                                                      point_type& lastPoint,
                                                      Prim const*& lastPrimitive) const
         requires kHasNormal
     {
-        auto const d = closestPoint(r, maxDistance, lastPoint, lastPrimitive);
-        return signedFrom(r, d, lastPoint, lastPrimitive);
+        return signedImpl(r, sqr(maxDistance), lastPoint, lastPrimitive);
     }
     std::optional<double> closestPointSignedDistance(point_type const& r, point_type& lastPoint) const
         requires kHasNormal
@@ -725,6 +796,9 @@ private:
 
     static constexpr double sqr(double v) noexcept { return v * v; }
 
+    //! Rounding allowance (relative to coordinate magnitude) for primitives sharing a closest point.
+    static constexpr double kSignTieEps = 1024 * std::numeric_limits<double>::epsilon();
+
     void checkBuilt() const
     {
         if (!mPending.empty())
@@ -796,12 +870,134 @@ private:
         return takeSqrt ? std::sqrt(h->distanceSqr) : h->distanceSqr;
     }
 
-    std::optional<double> signedFrom(point_type const& r, std::optional<double> d,
-                                     point_type const& lastPoint, Prim const* lastPrimitive) const
+    /**
+     * Sign of a signed-distance query.
+     *
+     * The normal of whichever primitive the nearest search happened to return is not enough:
+     * when the closest point lies on an edge or vertex shared by several primitives (beyond a
+     * sharp crease or spike tip, at a non-manifold edge), that primitive's normal can point
+     * away from the query point, and floating-point ties make the choice arbitrary.
+     *
+     * So every primitive tied for the minimum distance is considered, without needing mesh
+     * connectivity. Seen from the shared point, the surface is a fan of planar sectors (the
+     * primitives' tangent cones); the query direction lies on the correct side of the sector
+     * it is angularly nearest to. When the traits provide `coneAlignment` (built-in 3D
+     * triangles do), the primitive with the nearest tangent cone wins; among primitives
+     * equally near (all faces at an edge, or the two faces of the nearest edge at a vertex)
+     * the one whose normal is most aligned with the query direction wins, which for a fan of
+     * half-planes around an edge (and for 2D corners) is exactly the angularly nearest one.
+     */
+    std::optional<double> signedImpl(point_type const& r, double boundSq, point_type& lastPoint,
+                                     Prim const*& lastPrimitive) const
     {
-        if (!d) return std::nullopt;
-        double const s = geom::dot(geom::sub(r, lastPoint), Traits::normal(*lastPrimitive, lastPoint));
-        return (s > 0) ? *d : (s < 0) ? -*d : 0.0;
+        TieSet ties;
+        double const scale = maxAbs(r);
+        std::optional<Hit> const found = nearestWithTies(r, boundSq, scale, ties);
+        if (!report(found, lastPoint, lastPrimitive, true)) return std::nullopt;
+        double const d = std::sqrt(found->distanceSqr);
+        if (!(d > 0)) return 0.0;
+        double const tieTol = tieSlack(d, scale);
+        double const snap = 4 * std::sqrt(2 * tieTol * d) + tieTol;
+        double const angleTol = 1e-9 + 16 * tieTol / d;
+
+        bool have = false;
+        double bestCone = 0, bestFacing = 0;
+        auto consider = [&](Hit const& h) {
+            point_type apex = h.point;
+            double cone = 0;
+            if constexpr (kHasConeAlignment) {
+                ConeAlignment<N> const ca = Traits::coneAlignment(*h.primitive, h.point, r, snap);
+                apex = ca.apex;
+                cone = ca.cosAngle;
+            }
+            point_type const w = geom::sub(r, apex);
+            double const len = geom::length(w);
+            if (!(len > 0)) return;
+            double const s = geom::dot(w, Traits::normal(*h.primitive, h.point)) / len;
+            bool const better = !have || cone > bestCone + angleTol ||
+                                (cone >= bestCone - angleTol && std::abs(s) > std::abs(bestFacing));
+            if (!better) return;
+            have = true;
+            bestCone = cone;
+            bestFacing = s;
+            lastPoint = h.point;
+            lastPrimitive = h.primitive;
+        };
+        if (ties.overflow) {  // very high valence: fall back to a second, exact pass
+            visitWithin(r, d + tieTol, consider);
+        } else {
+            for (size_type i = 0; i < ties.count; ++i) consider(ties.hits[i]);
+        }
+        return (bestFacing > 0) ? d : (bestFacing < 0) ? -d : 0.0;
+    }
+
+    static constexpr size_type kMaxTies = 32;
+
+    //! Hits within the tie slack of the current best during a signed-distance search.
+    struct TieSet {
+        std::array<Hit, kMaxTies> hits;
+        size_type count = 0;
+        bool overflow = false;
+    };
+
+    static double maxAbs(point_type const& p) noexcept
+    {
+        double m = 0;
+        for (std::size_t i = 0; i < N; ++i) m = std::max(m, std::abs(p[i]));
+        return m;
+    }
+
+    //! Distance slack under which closest points agree up to rounding (count as shared).
+    static double tieSlack(double d, double scale) noexcept { return kSignTieEps * (scale + d); }
+
+    //! Like \ref nearestImpl, but also collects every primitive whose distance ties the best one.
+    std::optional<Hit> nearestWithTies(point_type const& pt, double boundSq, double scale, TieSet& ties) const
+    {
+        checkBuilt();
+        if (mNodes.empty()) return std::nullopt;
+        auto limitFor = [scale](double d2) {
+            double const d = std::sqrt(d2);
+            return sqr(d + tieSlack(d, scale));
+        };
+        double bestSq = boundSq;
+        double limitSq = limitFor(boundSq);  // prune bound: best distance plus tie slack
+        std::optional<Hit> best;
+        NodeEntry stack[kStackSize];
+        size_type top = 0;
+        stack[top++] = {0, mNodes[0].bounds.distanceSqr(pt)};
+        while (top) {
+            NodeEntry const e = stack[--top];
+            if (e.key > limitSq) continue;
+            Node const& n = mNodes[e.node];
+            if (n.count) {
+                for (std::uint32_t i = n.first; i < n.first + n.count; ++i) {
+                    point_type const cp = Traits::closestPoint(mPrims[i], pt);
+                    double const d2 = geom::distanceSqr(cp, pt);
+                    if (d2 > limitSq) continue;
+                    Hit const hit{d2, cp, &mPrims[i]};
+                    if (d2 < bestSq || (!best && d2 <= bestSq)) {  // same rule as nearestImpl
+                        bestSq = d2;
+                        best = hit;
+                        limitSq = limitFor(d2);
+                        size_type kept = 0;  // drop ties that are no longer within the slack
+                        for (size_type k = 0; k < ties.count; ++k)
+                            if (ties.hits[k].distanceSqr <= limitSq) ties.hits[kept++] = ties.hits[k];
+                        ties.count = kept;
+                    }
+                    if (ties.count < kMaxTies) {
+                        ties.hits[ties.count++] = hit;
+                    } else {
+                        ties.overflow = true;
+                    }
+                }
+            } else {
+                double const dl = mNodes[n.first].bounds.distanceSqr(pt);
+                double const dr = mNodes[n.first + 1].bounds.distanceSqr(pt);
+                pushOrdered(stack, top, n.first, dl <= limitSq ? std::optional(dl) : std::nullopt,
+                            n.first + 1, dr <= limitSq ? std::optional(dr) : std::nullopt);
+            }
+        }
+        return best;
     }
 
     std::optional<double> reportRay(point_type const& org, point_type const& dir, double tMax,
