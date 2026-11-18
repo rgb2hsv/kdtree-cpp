@@ -796,12 +796,34 @@ private:
         return takeSqrt ? std::sqrt(h->distanceSqr) : h->distanceSqr;
     }
 
+    //! Relative distance tolerance under which primitives count as tied for the sign.
+    static constexpr double kSignTieRelTol = 1e-6;
+
+    // The face normal of an arbitrary nearest primitive is wrong when the closest point lies on
+    // an edge / vertex shared by several primitives (e.g. beyond a sharp crease). Among all
+    // primitives tied for the minimum distance, take the sign of the one that best faces the
+    // query point (largest |cos| between r - q and its normal); on closed meshes this matches
+    // the angle-weighted pseudonormal sign without needing connectivity.
     std::optional<double> signedFrom(point_type const& r, std::optional<double> d,
-                                     point_type const& lastPoint, Prim const* lastPrimitive) const
+                                     point_type& lastPoint, Prim const*& lastPrimitive) const
     {
         if (!d) return std::nullopt;
-        double const s = geom::dot(geom::sub(r, lastPoint), Traits::normal(*lastPrimitive, lastPoint));
-        return (s > 0) ? *d : (s < 0) ? -*d : 0.0;
+        if (!(*d > 0)) return 0.0;
+        point_type const v0 = geom::sub(r, lastPoint);
+        double bestScore = geom::dot(v0, Traits::normal(*lastPrimitive, lastPoint)) / *d;
+        double const radius = *d * (1.0 + kSignTieRelTol);
+        visitWithin(r, radius, [&](Hit const& h) {
+            if (h.primitive == lastPrimitive) return;
+            double const len = std::sqrt(h.distanceSqr);
+            if (!(len > 0)) return;
+            double const score = geom::dot(geom::sub(r, h.point), Traits::normal(*h.primitive, h.point)) / len;
+            if (std::abs(score) > std::abs(bestScore)) {
+                bestScore = score;
+                lastPoint = h.point;
+                lastPrimitive = h.primitive;
+            }
+        });
+        return (bestScore > 0) ? *d : (bestScore < 0) ? -*d : 0.0;
     }
 
     std::optional<double> reportRay(point_type const& org, point_type const& dir, double tMax,
